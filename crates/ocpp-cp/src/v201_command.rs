@@ -166,10 +166,11 @@ use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
     CancelReservationStatusEnumType, CertificateActionEnumType, CertificateHashDataChainType,
     CertificateHashDataType, CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
-    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
-    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
-    ClearMessageStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingLimitType,
+    ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
+    ChargingProfileType, ChargingScheduleType, ClearCacheStatusEnumType,
+    ClearChargingProfileStatusEnumType, ClearChargingProfileType, ClearMessageStatusEnumType,
+    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
     DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
     GenericStatusEnumType, GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
     GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
@@ -185,14 +186,14 @@ use ocpp_types::v201::{
 use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
-    CostUpdatedResponse, CustomerInformationRequest, CustomerInformationResponse,
-    DeleteCertificateResponse, FirmwareStatusNotificationRequest, Get15118EVCertificateRequest,
-    GetChargingProfilesResponse, GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse,
-    GetLogRequest, GetLogResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
-    InstallCertificateResponse, LogStatusNotificationRequest, NotifyCustomerInformationRequest,
-    NotifyDisplayMessagesRequest, PublishFirmwareRequest, PublishFirmwareResponse,
-    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ClearedChargingLimitRequest, CostUpdatedResponse, CustomerInformationRequest,
+    CustomerInformationResponse, DeleteCertificateResponse, FirmwareStatusNotificationRequest,
+    Get15118EVCertificateRequest, GetChargingProfilesResponse, GetDisplayMessagesResponse,
+    GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse, GetMonitoringReportResponse,
+    GetTransactionStatusResponse, InstallCertificateResponse, LogStatusNotificationRequest,
+    NotifyChargingLimitRequest, NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest,
+    PublishFirmwareRequest, PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
     SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
@@ -2650,6 +2651,84 @@ pub fn v201_security_event_notification_request(
         event_type: event_type.to_string(),
         timestamp: timestamp.to_string(),
         tech_info: tech_info.map(str::to_string),
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `NotifyChargingLimit.req`
+/// ([`NotifyChargingLimitRequest`]) — the **CP-initiated** notification the
+/// Charging Station pushes when an *external* actor (a DSO/grid signal, an
+/// energy-management system, or the CSO) has imposed a charging limit on it or a
+/// connected EVSE (Part 2, charging-limit management; Issue #564).
+///
+/// Ports [`ocpp.v201.call.NotifyChargingLimit`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py):
+/// a [`ChargingLimitType`] (the limit and its source), an optional target
+/// `evseId`, and the optional resulting [`ChargingScheduleType`]s go in; an empty
+/// ack comes back. This is the *notify* half of the imposed → cleared lifecycle
+/// whose *cleared* half is [`v201_cleared_charging_limit_request`].
+///
+/// The three inputs are threaded through **verbatim** — the builder adds no
+/// policy. In particular the `chargingLimitSource` inside `charging_limit` is
+/// **caller-supplied**, not derived: unlike the profile-provenance mapping
+/// [`v201_charging_limit_source`] applies when *reporting installed profiles*
+/// (`ReportChargingProfiles`, #551), a `NotifyChargingLimit` reports a limit an
+/// external system actually imposed, so its source is a property of that event
+/// (`EMS` / `SO` / `Other` / `CSO`) rather than something inferable from a
+/// profile purpose. The reference threads `charging_limit_source` verbatim for
+/// the same reason.
+///
+/// Optionality is honored on the wire (both fields are omitted, not `null`, when
+/// `None`). The wire-level bounds the builder does **not** re-check — `evseId`
+/// must be `> 0` when present, and `chargingSchedule` must be non-empty when
+/// present (schema `minItems: 1`) — are enforced by the outbound schema
+/// validation in [`ChargePoint::call`](crate::ChargePoint::call), which surfaces
+/// a violation as an `Err`, never a panic. Pure over its input, so it is unit-
+/// and schema-testable without a runtime or a socket; emitting it as a CALL and
+/// surfacing the empty ack is the wiring layer's job
+/// ([`ChargePoint::request_notify_charging_limit`](crate::ChargePoint::request_notify_charging_limit)).
+#[must_use]
+pub fn v201_notify_charging_limit_request(
+    charging_limit: ChargingLimitType,
+    evse_id: Option<i32>,
+    charging_schedule: Option<Vec<ChargingScheduleType>>,
+) -> NotifyChargingLimitRequest {
+    NotifyChargingLimitRequest {
+        charging_limit,
+        evse_id,
+        charging_schedule,
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `ClearedChargingLimit.req`
+/// ([`ClearedChargingLimitRequest`]) — the **CP-initiated** notification the
+/// Charging Station pushes when a previously-imposed *external* charging limit is
+/// no longer in effect (Part 2, charging-limit management; Issue #564).
+///
+/// Ports [`ocpp.v201.call.ClearedChargingLimit`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py):
+/// a [`ChargingLimitSourceEnumType`] (which source's limit was lifted) plus an
+/// optional target `evseId` go in; an empty ack comes back. This is the *cleared*
+/// half of the imposed → cleared lifecycle whose *notify* half is
+/// [`v201_notify_charging_limit_request`].
+///
+/// The `charging_limit_source` is threaded through **verbatim** and, like the
+/// notify half, is **caller-supplied** rather than profile-derived — it names the
+/// source of the limit that was cleared (it should match the source the paired
+/// `NotifyChargingLimit` reported). `evseId` is omitted from the wire (not
+/// `null`) when `None`, meaning the cleared limit was station-wide; when present
+/// the schema requires `> 0`, enforced by the outbound schema validation in
+/// [`ChargePoint::call`](crate::ChargePoint::call). Pure over its input, so it is
+/// unit- and schema-testable without a runtime or a socket; emitting it as a CALL
+/// and surfacing the empty ack is the wiring layer's job
+/// ([`ChargePoint::request_cleared_charging_limit`](crate::ChargePoint::request_cleared_charging_limit)).
+#[must_use]
+pub fn v201_cleared_charging_limit_request(
+    charging_limit_source: ChargingLimitSourceEnumType,
+    evse_id: Option<i32>,
+) -> ClearedChargingLimitRequest {
+    ClearedChargingLimitRequest {
+        charging_limit_source,
+        evse_id,
         custom_data: None,
     }
 }
@@ -6625,6 +6704,205 @@ mod tests {
             Some(hostile.as_str()),
             "the builder relays techInfo byte-for-byte and never interprets it"
         );
+    }
+
+    // --- NotifyChargingLimit / ClearedChargingLimit (v201) builders (Issue #564) ---
+    // The CP-initiated, unsolicited external-charging-limit report pair: an
+    // external actor imposes a limit (`NotifyChargingLimit`) and later lifts it
+    // (`ClearedChargingLimit`). Both `.conf` are ack-only (empty); these tests
+    // cover the pure request builders (the driver hooks live in `lib.rs`).
+
+    fn sample_charging_schedule() -> ChargingScheduleType {
+        use ocpp_types::v201::{ChargingRateUnitEnumType, ChargingSchedulePeriodType};
+        ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::A,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 16.0,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn notify_charging_limit_request_threads_its_fields_verbatim() {
+        // The builder is a pure pass-through: the chargingLimit, and the optional
+        // evseId and chargingSchedule, land on the request unchanged, with no
+        // vendor extension added.
+        let limit = ChargingLimitType {
+            charging_limit_source: ChargingLimitSourceEnumType::So,
+            is_grid_critical: Some(true),
+            custom_data: None,
+        };
+        let full = v201_notify_charging_limit_request(
+            limit.clone(),
+            Some(2),
+            Some(vec![sample_charging_schedule()]),
+        );
+        assert_eq!(full.charging_limit, limit);
+        assert_eq!(full.evse_id, Some(2));
+        assert_eq!(
+            full.charging_schedule.as_deref().map(<[_]>::len),
+            Some(1),
+            "the caller's schedule is threaded through unchanged"
+        );
+        assert_eq!(
+            full.custom_data, None,
+            "the builder adds no vendor extension"
+        );
+
+        // The minimal form: only chargingLimit, both optionals omitted.
+        let minimal = v201_notify_charging_limit_request(limit.clone(), None, None);
+        assert_eq!(minimal.evse_id, None);
+        assert_eq!(minimal.charging_schedule, None);
+        assert_eq!(minimal.charging_limit, limit);
+    }
+
+    #[test]
+    fn notify_charging_limit_omitted_optionals_are_absent_not_null() {
+        // evseId and chargingSchedule are optional: when omitted they must not
+        // appear on the wire at all (not serialize to `null`), while the required
+        // chargingLimit is always present.
+        let req = v201_notify_charging_limit_request(
+            ChargingLimitType {
+                charging_limit_source: ChargingLimitSourceEnumType::Ems,
+                is_grid_critical: None,
+                custom_data: None,
+            },
+            None,
+            None,
+        );
+        let wire = serde_json::to_value(&req).expect("serialize NotifyChargingLimit.req");
+        assert!(
+            wire.get("evseId").is_none(),
+            "an omitted evseId is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("chargingSchedule").is_none(),
+            "an omitted chargingSchedule is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("chargingLimit").is_some(),
+            "chargingLimit is always present (required)"
+        );
+    }
+
+    #[test]
+    fn built_notify_charging_limit_requests_are_schema_valid() {
+        // A NotifyChargingLimit.req satisfies the bundled OCPP 2.0.1
+        // NotifyChargingLimit request JSON Schema across every source, both with
+        // and without the optional evseId and chargingSchedule. When present,
+        // chargingSchedule is non-empty (schema minItems: 1) and evseId is > 0.
+        let validator = SchemaValidator::v201();
+        let sources = [
+            ChargingLimitSourceEnumType::Ems,
+            ChargingLimitSourceEnumType::So,
+            ChargingLimitSourceEnumType::Other,
+            ChargingLimitSourceEnumType::Cso,
+        ];
+        // (evse_id, with_schedule) shapes to exercise the optional fields.
+        let shapes: [(Option<i32>, bool); 4] = [
+            (None, false),
+            (Some(1), false),
+            (None, true),
+            (Some(3), true),
+        ];
+        for source in sources {
+            for (evse_id, with_schedule) in shapes {
+                let limit = ChargingLimitType {
+                    charging_limit_source: source,
+                    is_grid_critical: Some(source == ChargingLimitSourceEnumType::So),
+                    custom_data: None,
+                };
+                let schedule = with_schedule.then(|| vec![sample_charging_schedule()]);
+                let req = v201_notify_charging_limit_request(limit, evse_id, schedule);
+                let payload = serde_json::to_value(&req).unwrap();
+                validator
+                    .validate_call("NotifyChargingLimit", &payload)
+                    .unwrap_or_else(|e| {
+                        panic!("built NotifyChargingLimit request (source={source:?}, evse_id={evse_id:?}, with_schedule={with_schedule}) is schema-valid, got: {e}")
+                    });
+                if with_schedule {
+                    assert!(
+                        !payload["chargingSchedule"].as_array().unwrap().is_empty(),
+                        "a present chargingSchedule is non-empty (schema minItems: 1)"
+                    );
+                }
+                if let Some(id) = evse_id {
+                    assert!(id > 0, "a present evseId is > 0 (schema constraint)");
+                    assert_eq!(payload["evseId"], serde_json::json!(id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cleared_charging_limit_request_threads_its_fields_verbatim() {
+        // Pure pass-through: the source, and the optional evseId, land on the
+        // request unchanged, with no vendor extension added.
+        let with = v201_cleared_charging_limit_request(ChargingLimitSourceEnumType::So, Some(4));
+        assert_eq!(with.charging_limit_source, ChargingLimitSourceEnumType::So);
+        assert_eq!(with.evse_id, Some(4));
+        assert_eq!(
+            with.custom_data, None,
+            "the builder adds no vendor extension"
+        );
+
+        let without = v201_cleared_charging_limit_request(ChargingLimitSourceEnumType::Ems, None);
+        assert_eq!(without.evse_id, None, "an omitted evseId stays absent");
+    }
+
+    #[test]
+    fn cleared_charging_limit_omitted_evse_id_is_absent_not_null() {
+        // evseId is optional: when omitted it must not appear on the wire (not
+        // null); the required chargingLimitSource is always present.
+        let req = v201_cleared_charging_limit_request(ChargingLimitSourceEnumType::Other, None);
+        let wire = serde_json::to_value(&req).expect("serialize ClearedChargingLimit.req");
+        assert!(
+            wire.get("evseId").is_none(),
+            "an omitted evseId is absent on the wire, not null: {wire}"
+        );
+        assert_eq!(
+            wire["chargingLimitSource"],
+            serde_json::json!("Other"),
+            "chargingLimitSource is always present (required)"
+        );
+    }
+
+    #[test]
+    fn built_cleared_charging_limit_requests_are_schema_valid() {
+        // A ClearedChargingLimit.req satisfies the bundled OCPP 2.0.1
+        // ClearedChargingLimit request JSON Schema across every source, both with
+        // and without the optional (> 0) evseId.
+        let validator = SchemaValidator::v201();
+        let sources = [
+            ChargingLimitSourceEnumType::Ems,
+            ChargingLimitSourceEnumType::So,
+            ChargingLimitSourceEnumType::Other,
+            ChargingLimitSourceEnumType::Cso,
+        ];
+        for source in sources {
+            for evse_id in [None, Some(1), Some(9)] {
+                let req = v201_cleared_charging_limit_request(source, evse_id);
+                let payload = serde_json::to_value(&req).unwrap();
+                validator
+                    .validate_call("ClearedChargingLimit", &payload)
+                    .unwrap_or_else(|e| {
+                        panic!("built ClearedChargingLimit request (source={source:?}, evse_id={evse_id:?}) is schema-valid, got: {e}")
+                    });
+                if let Some(id) = evse_id {
+                    assert!(id > 0, "a present evseId is > 0 (schema constraint)");
+                }
+            }
+        }
     }
 
     // --- SetNetworkProfile (v201) decision + response builder (Issue #528) ---
