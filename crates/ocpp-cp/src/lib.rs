@@ -154,17 +154,17 @@ use ocpp_messages::v201::{
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, CertificateActionEnumType,
     CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
-    ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
-    ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingNeedsType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, ChargingProfileType, ChargingScheduleType,
+    ConnectorStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
     DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
     GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
     MessageInfoType, MessageTriggerEnumType, MonitoringDataType, NetworkConnectionProfileType,
-    OCSPRequestDataType, OperationalStatusEnumType, PublishFirmwareStatusEnumType,
-    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
-    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
-    SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
+    NotifyEVChargingNeedsStatusEnumType, OCSPRequestDataType, OperationalStatusEnumType,
+    PublishFirmwareStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
+    ResetStatusEnumType, SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
     TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
     UploadLogStatusEnumType,
 };
@@ -6484,6 +6484,146 @@ impl ChargePoint {
         Ok(response)
     }
 
+    /// Originate an OCPP 2.0.1 `NotifyEVChargingNeeds` — the **CP-initiated**
+    /// first leg of the ISO 15118 smart-charging negotiation (Part 2, smart
+    /// charging; Issue #567).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.NotifyEVChargingNeeds`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// When an EV plugs in and declares its energy requirements, the station
+    /// forwards them to the CSMS: the EV's [`ChargingNeedsType`] (its requested
+    /// energy-transfer mode, optional departure time, and AC **or** DC charging
+    /// parameters) for a given `evse_id`, optionally hinting how many schedule
+    /// tuples the EV supports via `max_schedule_tuples`. The CSMS answers with a
+    /// [`NotifyEVChargingNeedsStatusEnumType`] — `Accepted` (a schedule will
+    /// follow), `Rejected` (service unavailable), or `Processing` (still
+    /// gathering information). That status is **returned** so the caller can drive
+    /// the negotiation to its [`NotifyEVChargingSchedule`](Self::request_notify_ev_charging_schedule)
+    /// leg — unlike an ack-only report, the status is the datum of interest.
+    ///
+    /// This is a **driver/sim hook**, called from application or test code rather
+    /// than from inside the inbound-CALL dispatch loop (a pure simulator has no
+    /// real EV, so the needs are injected deterministically by the caller). Like
+    /// [`request_sign_certificate`](Self::request_sign_certificate) it emits the
+    /// CALL inline via [`call`](Self::call) with no receive-loop re-entrancy
+    /// concern; `call()` schema-validates both the outgoing request and the
+    /// incoming `NotifyEVChargingNeeds.conf`. A `Rejected` or `Processing` status
+    /// is a valid *protocol* outcome, returned as `Ok(..)` (not an `Err`); the
+    /// status is surfaced without panic on any arm and any unknown status value
+    /// surfaces as an [`OcppError`] from `call()`'s validation, never a panic.
+    ///
+    /// V201-only: `NotifyEVChargingNeeds` has no 1.6J twin, so a call on a `V16J`
+    /// station is refused with [`OcppError::NotSupported`]. Transport/timeout/
+    /// CALLERROR failures propagate as [`OcppError`].
+    ///
+    /// Trust boundary: per the spec `evseId` may not be `0`, but the bundled 2.0.1
+    /// schema encodes `evseId` only as `type: integer` (the "may not be 0" is a
+    /// prose note, not a `minimum`), so `call()`'s outbound schema validation would
+    /// *not* catch it. This hook therefore guards the invariant itself, rejecting
+    /// `evse_id <= 0` with [`OcppError::ValidationError`] before emitting rather
+    /// than putting a spec-violating `evseId` on the wire. The charging-parameter
+    /// numeric fields ride as their typed values and are never parsed as anything
+    /// else.
+    pub async fn request_notify_ev_charging_needs(
+        &self,
+        charging_needs: ChargingNeedsType,
+        evse_id: i32,
+        max_schedule_tuples: Option<i32>,
+    ) -> OcppResult<NotifyEVChargingNeedsStatusEnumType> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "NotifyEVChargingNeeds is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+        if evse_id <= 0 {
+            return Err(OcppError::ValidationError {
+                message: format!(
+                    "NotifyEVChargingNeeds requires evseId > 0 (the EVSE the EV is connected to), got {evse_id}"
+                ),
+            });
+        }
+
+        let request = v201_command::v201_notify_ev_charging_needs_request(
+            charging_needs,
+            evse_id,
+            max_schedule_tuples,
+        );
+        let response = self.call(request).await?;
+
+        info!(
+            evse_id,
+            status = ?response.status,
+            "NotifyEVChargingNeeds answered by the CSMS"
+        );
+
+        Ok(response.status)
+    }
+
+    /// Originate an OCPP 2.0.1 `NotifyEVChargingSchedule` — the **CP-initiated**
+    /// second leg of the ISO 15118 smart-charging negotiation (Part 2, smart
+    /// charging; Issue #567).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.NotifyEVChargingSchedule`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// After the needs are reported, the station tells the CSMS which
+    /// [`ChargingScheduleType`] the EV intends to follow, with its periods
+    /// relative to `time_base` (an RFC 3339 instant) for a given `evse_id`. The
+    /// CSMS acks with a shared [`GenericStatusEnumType`] (`Accepted` / `Rejected`)
+    /// that reports only whether it could process the message — **not** approval
+    /// of the schedule. That status is **returned** to the caller.
+    ///
+    /// This is a **driver/sim hook** with the same discipline as
+    /// [`request_notify_ev_charging_needs`](Self::request_notify_ev_charging_needs):
+    /// it emits the CALL inline via [`call`](Self::call), which schema-validates
+    /// both the outgoing request and the incoming `NotifyEVChargingSchedule.conf`.
+    /// A `Rejected` status is a valid *protocol* outcome, returned as `Ok(..)`;
+    /// the status is surfaced without panic on either arm.
+    ///
+    /// V201-only: refused on a `V16J` station with [`OcppError::NotSupported`].
+    /// Trust boundary: as with the needs leg, the spec's `evseId > 0` invariant is
+    /// documented in prose but not encoded as a schema `minimum`, so this hook
+    /// guards it, rejecting `evse_id <= 0` with [`OcppError::ValidationError`]
+    /// before emitting. Transport/timeout/CALLERROR failures propagate as
+    /// [`OcppError`].
+    pub async fn request_notify_ev_charging_schedule(
+        &self,
+        time_base: &str,
+        charging_schedule: ChargingScheduleType,
+        evse_id: i32,
+    ) -> OcppResult<GenericStatusEnumType> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "NotifyEVChargingSchedule is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+        if evse_id <= 0 {
+            return Err(OcppError::ValidationError {
+                message: format!(
+                    "NotifyEVChargingSchedule requires evseId > 0 (the EVSE the schedule applies to), got {evse_id}"
+                ),
+            });
+        }
+
+        let request = v201_command::v201_notify_ev_charging_schedule_request(
+            time_base,
+            charging_schedule,
+            evse_id,
+        );
+        let response = self.call(request).await?;
+
+        info!(
+            evse_id,
+            status = ?response.status,
+            "NotifyEVChargingSchedule answered by the CSMS"
+        );
+
+        Ok(response.status)
+    }
+
     /// Originate an OCPP 2.0.1 `SecurityEventNotification` — the **CP-initiated**
     /// security-audit report the station pushes to the CSMS (Part 2, message A0x
     /// and the OCPP Security Whitepaper; Issue #562).
@@ -12107,6 +12247,218 @@ mod tests {
         assert!(matches!(
             cp.request_get_certificate_status(sample_ocsp_request_data())
                 .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    // --- OCPP 2.0.1 NotifyEVChargingNeeds / NotifyEVChargingSchedule CP-initiated
+    //     smart-charging negotiation (M7, #567) ---
+    // The station reports the EV's charging needs, then the schedule it intends to
+    // follow; each hook emits the CALL and returns the CSMS's negotiation status.
+    // These exercise the driver hooks against a mock CSMS. V201-only; evseId > 0.
+
+    fn sample_ev_charging_needs() -> ChargingNeedsType {
+        use ocpp_types::v201::{DCChargingParametersType, EnergyTransferModeEnumType};
+        ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::Dc,
+            departure_time: Some("2022-01-01T12:00:00Z".to_string()),
+            ac_charging_parameters: None,
+            dc_charging_parameters: Some(DCChargingParametersType {
+                ev_max_current: 400,
+                ev_max_voltage: 900,
+                energy_amount: Some(60000),
+                ev_max_power: Some(150000),
+                state_of_charge: Some(20),
+                ev_energy_capacity: Some(80000),
+                full_soc: Some(100),
+                bulk_soc: Some(80),
+                custom_data: None,
+            }),
+            custom_data: None,
+        }
+    }
+
+    fn sample_ev_charging_schedule() -> ChargingScheduleType {
+        use ocpp_types::v201::{ChargingRateUnitEnumType, ChargingSchedulePeriodType};
+        ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::A,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 16.0,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_needs_surfaces_accepted_status() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "NotifyEVChargingNeeds".to_string(),
+            serde_json::json!({"status": "Accepted"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let status = cp
+            .request_notify_ev_charging_needs(sample_ev_charging_needs(), 1, Some(4))
+            .await
+            .unwrap();
+        assert_eq!(status, NotifyEVChargingNeedsStatusEnumType::Accepted);
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_needs_surfaces_processing_without_panic() {
+        // `Processing` (the CSMS is still gathering info) is a valid protocol
+        // outcome, returned as `Ok(..)`, not an error.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "NotifyEVChargingNeeds".to_string(),
+            serde_json::json!({"status": "Processing"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let status = cp
+            .request_notify_ev_charging_needs(sample_ev_charging_needs(), 2, None)
+            .await
+            .unwrap();
+        assert_eq!(status, NotifyEVChargingNeedsStatusEnumType::Processing);
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_needs_rejects_non_positive_evse_id() {
+        // The spec forbids evseId 0, but the schema doesn't encode a `minimum`, so
+        // the hook itself must guard it before emitting.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert!(matches!(
+            cp.request_notify_ev_charging_needs(sample_ev_charging_needs(), 0, None)
+                .await,
+            Err(OcppError::ValidationError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_needs_is_v201_only() {
+        // A 1.6J station has no NotifyEVChargingNeeds path.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_notify_ev_charging_needs(sample_ev_charging_needs(), 1, None)
+                .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_schedule_surfaces_accepted_status() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "NotifyEVChargingSchedule".to_string(),
+            serde_json::json!({"status": "Accepted"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let status = cp
+            .request_notify_ev_charging_schedule(
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, GenericStatusEnumType::Accepted);
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_schedule_surfaces_rejected_without_panic() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "NotifyEVChargingSchedule".to_string(),
+            serde_json::json!({"status": "Rejected"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let status = cp
+            .request_notify_ev_charging_schedule(
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, GenericStatusEnumType::Rejected);
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_schedule_rejects_non_positive_evse_id() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert!(matches!(
+            cp.request_notify_ev_charging_schedule(
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+                -1,
+            )
+            .await,
+            Err(OcppError::ValidationError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_notify_ev_charging_schedule_is_v201_only() {
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_notify_ev_charging_schedule(
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+                1,
+            )
+            .await,
             Err(OcppError::NotSupported { .. })
         ));
     }
