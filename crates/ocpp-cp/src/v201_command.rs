@@ -2653,7 +2653,8 @@ pub fn v201_get_15118_ev_certificate_request(
 ///
 /// Ports [`ocpp.v201.call.NotifyEVChargingNeeds`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
 /// When an EV declares its energy requirements, the station forwards the EV's
-/// [`ChargingNeedsType`] (its requested [`EnergyTransferModeEnumType`], optional
+/// [`ChargingNeedsType`] (its requested
+/// [`EnergyTransferModeEnumType`](ocpp_types::v201::EnergyTransferModeEnumType), optional
 /// departure time, and AC **or** DC charging parameters) for a given `evseId` so
 /// the CSMS can compute a schedule; the CSMS acks with a
 /// [`NotifyEVChargingNeedsStatusEnumType`](ocpp_types::v201::NotifyEVChargingNeedsStatusEnumType)
@@ -2695,7 +2696,7 @@ pub fn v201_notify_ev_charging_needs_request(
 /// The station reports the [`ChargingScheduleType`] the EV intends to follow,
 /// with its periods relative to `time_base` (an RFC 3339 instant) for a given
 /// `evseId`; the CSMS acks with a shared
-/// [`GenericStatusEnumType`](ocpp_types::v201::GenericStatusEnumType) (`Accepted`
+/// [`GenericStatusEnumType`] (`Accepted`
 /// / `Rejected`) that reports only whether it could process the message — not
 /// approval of the schedule.
 ///
