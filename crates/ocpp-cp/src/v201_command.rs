@@ -193,11 +193,12 @@ use ocpp_messages::v201::{
     NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest, PublishFirmwareRequest,
     PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
     ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    SetNetworkProfileRequest, SetNetworkProfileResponse, SignCertificateRequest,
-    TriggerMessageResponse, UnlockConnectorResponse, UnpublishFirmwareRequest,
-    UnpublishFirmwareResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
+    SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
+    SetNetworkProfileResponse, SignCertificateRequest, TriggerMessageResponse,
+    UnlockConnectorResponse, UnpublishFirmwareRequest, UnpublishFirmwareResponse,
+    UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -901,6 +902,55 @@ pub fn v201_clear_charging_profile_response(matched: bool) -> ClearChargingProfi
     }
 }
 
+/// Map a stored charging profile's
+/// [`purpose`](ChargingProfilePurposeEnumType) to the
+/// [`ChargingLimitSourceEnumType`] the station reports it under in
+/// `ReportChargingProfiles` (and filters it by in a `GetChargingProfiles`
+/// `chargingLimitSource` criterion).
+///
+/// OCPP 2.0.1 (Part 2) reports a charging limit's *origin*, not merely the API
+/// that installed it. Every profile the simulator holds was installed by the
+/// CSMS over `SetChargingProfile`, but the purpose records **whose constraint**
+/// it represents:
+///
+/// - **`TxProfile` / `TxDefaultProfile` / `ChargingStationMaxProfile`** →
+///   [`Cso`](ChargingLimitSourceEnumType::Cso). These are Charging Station
+///   Operator configuration — the transaction schedule, the per-EVSE default,
+///   and the operator's station ceiling — all authored by the CSO / back office.
+/// - **`ChargingStationExternalConstraints`** →
+///   [`So`](ChargingLimitSourceEnumType::So). This purpose models a ceiling
+///   imposed by an actor *external* to the CSO — a distribution/grid System
+///   Operator or an energy-management signal relayed through the CSMS. Of the
+///   non-CSO sources (`EMS` / `Other` / `SO`), `SO` is the canonical mapping for
+///   the grid/DSO external-constraint signal OCPP 2.0.1 Part 2 describes, so a
+///   CSMS filtering `GetChargingProfiles` by source can tell an external ceiling
+///   apart from operator configuration. (`EMS` would assert an
+///   energy-management origin the simulator cannot substantiate; `SO` is the
+///   faithful, least-surprising choice for the external-constraints purpose.)
+///
+/// Pure and total over the four-variant purpose enum, so it is the single source
+/// of truth both the reporting pager and the query filter derive the wire source
+/// from.
+#[must_use]
+pub fn v201_charging_limit_source(
+    purpose: ChargingProfilePurposeEnumType,
+) -> ChargingLimitSourceEnumType {
+    match purpose {
+        // An externally-imposed ceiling (grid / System Operator signal), distinct
+        // from the operator's own configuration.
+        ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {
+            ChargingLimitSourceEnumType::So
+        }
+        // CSO (Charging Station Operator) configuration: the transaction schedule,
+        // the per-EVSE default, and the operator's own station ceiling.
+        ChargingProfilePurposeEnumType::TxProfile
+        | ChargingProfilePurposeEnumType::TxDefaultProfile
+        | ChargingProfilePurposeEnumType::ChargingStationMaxProfile => {
+            ChargingLimitSourceEnumType::Cso
+        }
+    }
+}
+
 /// Select the installed `TxProfile` slots an inbound `GetChargingProfiles.req`
 /// asks the station to report, returning the matching `(evse_id, profile)` pairs.
 ///
@@ -941,11 +991,16 @@ pub fn v201_clear_charging_profile_response(matched: bool) -> ClearChargingProfi
 /// - **`chargingProfileId`** — absent = any; present = the stored profile's `id`
 ///   must be one of the listed ids (an id list naming nothing installed matches
 ///   nothing).
-/// - **`chargingLimitSource`** — absent = any; present must contain
-///   [`Cso`](ChargingLimitSourceEnumType::Cso). Every profile the simulator
-///   installs (via `RequestStartTransaction` / `SetChargingProfile`) originates
-///   from the CSMS — the `CSO` source — so a criterion that excludes `CSO`
-///   matches nothing here, faithful to the store's provenance.
+/// - **`chargingLimitSource`** — absent = any; present must contain the profile's
+///   own source, derived from its purpose by
+///   [`v201_charging_limit_source`]: `TxProfile` / `TxDefaultProfile` /
+///   `ChargingStationMaxProfile` report as
+///   [`Cso`](ChargingLimitSourceEnumType::Cso) (operator configuration) while a
+///   `ChargingStationExternalConstraints` ceiling reports as
+///   [`So`](ChargingLimitSourceEnumType::So) (an external grid/DSO signal). So a
+///   CSMS asking for `[Cso]` gets the operator profiles and not the external
+///   ceiling, and `[SO]` gets only the external ceiling (#551) — the filter is no
+///   longer a no-op across the combined store.
 ///
 /// An empty criterion `{}` with no `evseId` matches every installed profile. Each
 /// criterion field is an independent, conjunctive filter and an absent field is a
@@ -975,10 +1030,11 @@ pub fn v201_get_charging_profiles_matches(
                     .charging_profile_id
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&profile.id))
-                && criterion
-                    .charging_limit_source
-                    .as_ref()
-                    .is_none_or(|srcs| srcs.contains(&ChargingLimitSourceEnumType::Cso))
+                && criterion.charging_limit_source.as_ref().is_none_or(|srcs| {
+                    srcs.contains(&v201_charging_limit_source(
+                        profile.charging_profile_purpose,
+                    ))
+                })
         })
         .cloned()
         .collect()
@@ -1013,25 +1069,29 @@ pub fn v201_get_charging_profiles_response(matched: bool) -> GetChargingProfiles
 ///
 /// The asynchronous data half of the report flow:
 /// [`v201_get_charging_profiles_matches`] resolves which installed slots to
-/// report, and this builds one [`ReportChargingProfilesRequest`] per **EVSE** —
-/// each echoing the triggering `request_id`, tagged with the
-/// [`Cso`](ChargingLimitSourceEnumType::Cso) source (every stored profile is
-/// CSMS-installed), and carrying every matched profile on that EVSE. Pages are
-/// ordered by ascending `evse_id` and the profiles within a page by ascending
-/// `id` (the store snapshots are unordered `HashMap` walks, so both sorts make
-/// the stream deterministic), and every page but the last is flagged `tbc`
-/// ("to be continued"); the final page leaves `tbc` absent (= `false`). An
-/// empty match set builds no pages — there is nothing to stream.
+/// report, and this builds one [`ReportChargingProfilesRequest`] per
+/// **`(evseId, chargingLimitSource)`** — each echoing the triggering
+/// `request_id`, tagged with that group's source (derived per profile by
+/// [`v201_charging_limit_source`]), and carrying every matched profile of that
+/// source on that EVSE. Pages are ordered by ascending `evse_id` then source,
+/// and the profiles within a page by ascending `id` (the store snapshots are
+/// unordered `HashMap` walks, so all sorts make the stream deterministic), and
+/// every page but the last is flagged `tbc` ("to be continued"); the final page
+/// leaves `tbc` absent (= `false`). An empty match set builds no pages — there
+/// is nothing to stream.
 ///
 /// Since #519 the match set is drawn from **three** stores — the per-EVSE
 /// `TxProfile` store, the `TxDefaultProfile` store, and the station-ceiling
-/// store — so one EVSE can now carry several profiles (e.g. a `TxProfile`, a
+/// store — so one EVSE can carry several profiles (a `TxProfile`, a
 /// `TxDefaultProfile`, and both `ChargingStationMaxProfile` /
-/// `ChargingStationExternalConstraints` ceilings). They are **grouped per EVSE**
-/// into a single page (`chargingProfile` array), which is how OCPP 2.0.1 reports
-/// them (per `chargingLimitSource` + `evseId`; every stored profile here shares
-/// the `CSO` source). Grouping keeps each page's `chargingProfile` non-empty, so
-/// every built `ReportChargingProfiles` satisfies the schema's `minItems: 1`.
+/// `ChargingStationExternalConstraints` ceilings). OCPP 2.0.1 reports profiles
+/// per `(chargingLimitSource, evseId)`, and a `ChargingStationExternalConstraints`
+/// ceiling reports under the external [`So`](ChargingLimitSourceEnumType::So)
+/// source while the operator profiles report under
+/// [`Cso`](ChargingLimitSourceEnumType::Cso) (#551) — so an EVSE holding both an
+/// operator profile and an external ceiling **splits into two pages with
+/// distinct sources**. Grouping keeps each page's `chargingProfile` non-empty,
+/// so every built `ReportChargingProfiles` satisfies the schema's `minItems: 1`.
 ///
 /// Pure over its inputs, so it is unit-testable without a runtime; sending the
 /// pages over the wire is the wiring layer's job.
@@ -1040,30 +1100,39 @@ pub fn v201_report_charging_profiles_pages(
     request_id: i32,
     matched: &[(i32, ChargingProfileType)],
 ) -> Vec<ReportChargingProfilesRequest> {
-    // Group the matched profiles by EVSE. A `BTreeMap` gives a deterministic
-    // ascending-`evse_id` page order despite the unordered store snapshots; the
-    // profiles within each page are sorted by `id` for the same determinism.
-    let mut by_evse: BTreeMap<i32, Vec<ChargingProfileType>> = BTreeMap::new();
+    // Group the matched profiles per `(evse_id, chargingLimitSource)` — the unit
+    // OCPP 2.0.1 reports a profile page under. A `BTreeMap` gives a deterministic
+    // ascending-`(evse_id, source)` page order despite the unordered store
+    // snapshots; the profiles within each page are sorted by `id` for the same
+    // determinism.
+    let mut by_key: BTreeMap<(i32, ChargingLimitSourceEnumType), Vec<ChargingProfileType>> =
+        BTreeMap::new();
     for (evse_id, profile) in matched {
-        by_evse.entry(*evse_id).or_default().push(profile.clone());
+        let source = v201_charging_limit_source(profile.charging_profile_purpose);
+        by_key
+            .entry((*evse_id, source))
+            .or_default()
+            .push(profile.clone());
     }
-    for profiles in by_evse.values_mut() {
+    for profiles in by_key.values_mut() {
         profiles.sort_by_key(|profile| profile.id);
     }
 
-    let last = by_evse.len().saturating_sub(1);
-    by_evse
+    let last = by_key.len().saturating_sub(1);
+    by_key
         .into_iter()
         .enumerate()
         .map(
-            |(i, (evse_id, charging_profile))| ReportChargingProfilesRequest {
-                request_id,
-                charging_limit_source: ChargingLimitSourceEnumType::Cso,
-                charging_profile,
-                evse_id,
-                // Every page but the last announces that more follow.
-                tbc: (i < last).then_some(true),
-                custom_data: None,
+            |(i, ((evse_id, charging_limit_source), charging_profile))| {
+                ReportChargingProfilesRequest {
+                    request_id,
+                    charging_limit_source,
+                    charging_profile,
+                    evse_id,
+                    // Every page but the last announces that more follow.
+                    tbc: (i < last).then_some(true),
+                    custom_data: None,
+                }
             },
         )
         .collect()
@@ -2571,6 +2640,52 @@ pub fn v201_get_15118_ev_certificate_request(
         iso15118_schema_version: iso15118_schema_version.to_string(),
         action,
         exi_request: exi_request.to_string(),
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `SecurityEventNotification.req`
+/// ([`SecurityEventNotificationRequest`]) — the **CP-initiated** security-audit
+/// report the Charging Station pushes to the CSMS (Part 2, message A0x and the
+/// OCPP Security Whitepaper; Issue #562).
+///
+/// Ports [`ocpp.v201.call.SecurityEventNotification`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// The station proactively reports a security-relevant occurrence — a firmware
+/// update, an invalid firmware signature, tamper detection, a reboot, … — for
+/// the CSMS to record (a SIEM, an alert, a compliance log); the CSMS answers
+/// with an empty ack. The three request fields are threaded through
+/// **verbatim** — the builder adds no policy.
+///
+/// `event_type` is an **open** wire string, not a closed `enum`: the schema
+/// types it as `string` (`maxLength: 50`) and the standardized names are only a
+/// recommendation, so a station may report a vendor-specific event. Callers who
+/// want a standardized name without a stringly-typed typo pass
+/// [`SecurityEventType::as_wire_str`](ocpp_types::v201::SecurityEventType::as_wire_str);
+/// the field stays a `&str` here so both are accepted. `tech_info` is the
+/// optional vendor-specific detail (`maxLength: 255`), omitted from the wire
+/// when `None`.
+///
+/// `tech_info` is opaque caller-supplied text: it is copied into the request
+/// untouched — never parsed as a path, decoded, or executed. An over-long value
+/// is not truncated here (silently corrupting opaque text is worse than
+/// rejecting it); the wire-level `maxLength` bound is enforced by the outbound
+/// schema validation in [`ChargePoint::call`](crate::ChargePoint::call), which
+/// surfaces an over-long field as an `Err`, never a panic.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or
+/// a socket; emitting it as a CALL and surfacing the empty ack is the wiring
+/// layer's job
+/// ([`ChargePoint::request_security_event_notification`](crate::ChargePoint::request_security_event_notification)).
+#[must_use]
+pub fn v201_security_event_notification_request(
+    event_type: &str,
+    timestamp: &str,
+    tech_info: Option<&str>,
+) -> SecurityEventNotificationRequest {
+    SecurityEventNotificationRequest {
+        event_type: event_type.to_string(),
+        timestamp: timestamp.to_string(),
+        tech_info: tech_info.map(str::to_string),
         custom_data: None,
     }
 }
@@ -4516,6 +4631,29 @@ mod tests {
     }
 
     #[test]
+    fn charging_limit_source_maps_purpose_to_provenance() {
+        // Operator configuration → CSO; an external-constraints ceiling → SO (#551).
+        for purpose in [
+            ChargingProfilePurposeEnumType::TxProfile,
+            ChargingProfilePurposeEnumType::TxDefaultProfile,
+            ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+        ] {
+            assert_eq!(
+                v201_charging_limit_source(purpose),
+                ChargingLimitSourceEnumType::Cso,
+                "{purpose:?} is CSO operator configuration"
+            );
+        }
+        assert_eq!(
+            v201_charging_limit_source(
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints
+            ),
+            ChargingLimitSourceEnumType::So,
+            "an external-constraints ceiling reports under the external SO source"
+        );
+    }
+
+    #[test]
     fn get_criteria_and_evse_id_are_conjunctive() {
         let store = clear_test_store();
         // evseId 1 AND stackLevel 3 — EVSE 1's profile is at stack 0, so the two
@@ -4776,11 +4914,65 @@ mod tests {
     }
 
     #[test]
-    fn report_pages_group_multiple_profiles_on_one_evse() {
-        // An EVSE now carries several profiles (a TxProfile + a TxDefaultProfile);
-        // the pager groups them into one page, profiles sorted by id, EVSEs sorted
-        // ascending, tbc set on every page but the last. Ids are deliberately out
-        // of order in the input to prove the sort.
+    fn get_charging_limit_source_criterion_distinguishes_cso_from_external() {
+        // The combined store holds three CSO profiles (TxProfile 10, TxDefault 30,
+        // Max ceiling 40) and one external-constraints ceiling (50) that reports
+        // under SO. A source criterion now filters by each profile's derived
+        // source, not a blanket CSO (#551).
+        let store = combined_profile_store();
+        // `[Cso]` selects the operator profiles and never the external ceiling.
+        let cso = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::Cso]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &cso, &store)),
+            vec![10, 30, 40],
+            "a [Cso] criterion returns the operator profiles, excluding the external ceiling"
+        );
+        // `[SO]` selects only the external-constraints ceiling.
+        let so = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::So]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &so, &store)),
+            vec![50],
+            "an [SO] criterion returns only the external-constraints ceiling"
+        );
+        // A source present in neither (`Other`) matches nothing.
+        let other = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::Other]),
+            ..any_criterion()
+        };
+        assert!(
+            v201_get_charging_profiles_matches(None, &other, &store).is_empty(),
+            "an [Other] criterion matches nothing installed"
+        );
+        // A union of both sources reports the whole combined set.
+        let both = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![
+                ChargingLimitSourceEnumType::Cso,
+                ChargingLimitSourceEnumType::So,
+            ]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &both, &store)),
+            vec![10, 30, 40, 50],
+            "a [Cso, SO] criterion reports every installed profile"
+        );
+    }
+
+    #[test]
+    fn report_pages_group_same_source_profiles_and_split_cross_source() {
+        // EVSE 1 holds a TxProfile + a TxDefaultProfile (both CSO source): they
+        // share a source, so they group into one page. EVSE 0 holds a
+        // ChargingStationMaxProfile (CSO) and a ChargingStationExternalConstraints
+        // ceiling (SO): distinct sources, so they split into two pages (#551).
+        // Profiles within a page are sorted by id, pages ordered by (evseId,
+        // source), tbc set on every page but the last. Ids/inputs deliberately out
+        // of order to prove the sorts.
         let matched = vec![
             (
                 1,
@@ -4808,32 +5000,62 @@ mod tests {
             ),
         ];
         let pages = v201_report_charging_profiles_pages(9, &matched);
-        assert_eq!(pages.len(), 2, "two EVSEs → two pages, one per EVSE");
-        // Page 0: whole-station EVSE 0, both ceilings, sorted by id, continues.
+        assert_eq!(
+            pages.len(),
+            3,
+            "EVSE 0 splits into an SO + a CSO page; EVSE 1's two CSO profiles group into one"
+        );
+        // Ordered by (evseId, source); on EVSE 0 the SO page precedes the CSO page
+        // (declaration order EMS < Other < SO < CSO).
+        // Page 0: EVSE 0, the external ceiling under SO.
         assert_eq!(pages[0].evse_id, 0);
+        assert_eq!(
+            pages[0].charging_limit_source,
+            ChargingLimitSourceEnumType::So
+        );
         assert_eq!(
             pages[0]
                 .charging_profile
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
-            vec![40, 50],
-            "the EVSE-0 page groups both ceilings, sorted by id"
+            vec![50],
+            "the external-constraints ceiling reports alone under SO"
         );
-        assert_eq!(pages[0].tbc, Some(true), "the first of two pages continues");
-        // Page 1: EVSE 1, TxProfile + TxDefaultProfile, sorted by id, terminal.
-        assert_eq!(pages[1].evse_id, 1);
+        assert_eq!(pages[0].tbc, Some(true), "not the last page");
+        // Page 1: EVSE 0, the operator max-profile ceiling under CSO.
+        assert_eq!(pages[1].evse_id, 0);
+        assert_eq!(
+            pages[1].charging_limit_source,
+            ChargingLimitSourceEnumType::Cso
+        );
         assert_eq!(
             pages[1]
                 .charging_profile
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
+            vec![40],
+            "the operator ceiling reports alone under CSO"
+        );
+        assert_eq!(pages[1].tbc, Some(true), "not the last page");
+        // Page 2: EVSE 1, the TxProfile + TxDefaultProfile grouped under CSO.
+        assert_eq!(pages[2].evse_id, 1);
+        assert_eq!(
+            pages[2].charging_limit_source,
+            ChargingLimitSourceEnumType::Cso
+        );
+        assert_eq!(
+            pages[2]
+                .charging_profile
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
             vec![10, 30],
-            "the EVSE-1 page groups the TxProfile and TxDefaultProfile, sorted by id"
+            "same-source profiles on one EVSE group into a single page, sorted by id"
         );
         assert!(
-            !pages[1].tbc.unwrap_or(false),
+            !pages[2].tbc.unwrap_or(false),
             "the last page is not 'to be continued'"
         );
         assert!(pages.iter().all(|p| p.request_id == 9));
@@ -4841,33 +5063,26 @@ mod tests {
 
     #[test]
     fn built_multi_profile_report_page_is_schema_valid() {
-        // A single EVSE-0 page carrying both station ceilings must satisfy the
-        // bundled OCPP 2.0.1 ReportChargingProfiles schema (minItems: 1 on
-        // chargingProfile, multiple entries allowed).
+        // A single EVSE-1 page carrying two same-source (CSO) profiles — a
+        // TxProfile and a TxDefaultProfile — must satisfy the bundled OCPP 2.0.1
+        // ReportChargingProfiles schema (minItems: 1 on chargingProfile, multiple
+        // entries allowed).
         let validator = SchemaValidator::v201();
         let matched = vec![
             (
-                0,
-                clear_test_profile(
-                    40,
-                    0,
-                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
-                ),
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
             ),
             (
-                0,
-                clear_test_profile(
-                    50,
-                    0,
-                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
-                ),
+                1,
+                clear_test_profile(30, 1, ChargingProfilePurposeEnumType::TxDefaultProfile),
             ),
         ];
         let pages = v201_report_charging_profiles_pages(1, &matched);
         assert_eq!(
             pages.len(),
             1,
-            "both ceilings on EVSE 0 group into one page"
+            "two CSO profiles on EVSE 1 group into one page"
         );
         assert_eq!(pages[0].charging_profile.len(), 2);
         let payload = serde_json::to_value(&pages[0]).unwrap();
@@ -4876,6 +5091,35 @@ mod tests {
                 .validate_call("ReportChargingProfiles", &payload)
                 .is_ok(),
             "a multi-profile ReportChargingProfiles page should be schema-valid, got: {payload}"
+        );
+    }
+
+    /// Wire fidelity: an SO-sourced `ReportChargingProfiles` page (an external
+    /// `ChargingStationExternalConstraints` ceiling) satisfies the bundled OCPP
+    /// 2.0.1 schema — the `chargingLimitSource` enum accepts `SO`, not just `CSO`.
+    #[test]
+    fn built_external_constraint_report_page_reports_so_and_is_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let matched = vec![(
+            0,
+            clear_test_profile(
+                50,
+                0,
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+            ),
+        )];
+        let pages = v201_report_charging_profiles_pages(7, &matched);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].charging_limit_source,
+            ChargingLimitSourceEnumType::So
+        );
+        let payload = serde_json::to_value(&pages[0]).unwrap();
+        assert!(
+            validator
+                .validate_call("ReportChargingProfiles", &payload)
+                .is_ok(),
+            "an SO-sourced ReportChargingProfiles page should be schema-valid, got: {payload}"
         );
     }
 
@@ -6316,6 +6560,161 @@ mod tests {
             assert!(payload.get("action").is_some());
             assert!(payload.get("exiRequest").is_some());
         }
+    }
+
+    // --- SecurityEventNotification (v201) CP-initiated request builder (Issue #562) ---
+
+    #[test]
+    fn security_event_notification_request_threads_its_fields_verbatim() {
+        // The builder is a pure pass-through: the event type, timestamp, and the
+        // optional techInfo land on the request unchanged, with no vendor
+        // extension added. Present and omitted techInfo both round-trip.
+        let with = v201_security_event_notification_request(
+            "TamperDetectionActivated",
+            "2026-09-05T12:00:00Z",
+            Some("enclosure switch opened"),
+        );
+        assert_eq!(with.event_type, "TamperDetectionActivated");
+        assert_eq!(with.timestamp, "2026-09-05T12:00:00Z");
+        assert_eq!(with.tech_info.as_deref(), Some("enclosure switch opened"));
+        assert_eq!(
+            with.custom_data, None,
+            "the builder adds no vendor extension"
+        );
+
+        let without = v201_security_event_notification_request(
+            "StartupOfTheDevice",
+            "2026-09-05T12:00:01Z",
+            None,
+        );
+        assert_eq!(without.tech_info, None, "an omitted techInfo stays absent");
+    }
+
+    #[test]
+    fn security_event_notification_omitted_tech_info_is_absent_not_null() {
+        // techInfo is optional: when omitted it must not appear on the wire at
+        // all (not serialize to `null`), matching the schema's optional field.
+        let req =
+            v201_security_event_notification_request("ResetOrReboot", "2026-09-05T12:00:02Z", None);
+        let wire = serde_json::to_value(&req).expect("serialize SecurityEventNotification.req");
+        assert!(
+            wire.get("techInfo").is_none(),
+            "the omitted techInfo is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("type").is_some(),
+            "type is always present (required)"
+        );
+        assert!(
+            wire.get("timestamp").is_some(),
+            "timestamp is always present (required)"
+        );
+    }
+
+    #[test]
+    fn built_security_event_notification_requests_are_schema_valid() {
+        use ocpp_types::v201::SecurityEventType;
+
+        // The type field is an open string, so both a recommended
+        // `SecurityEventType` (threaded via its wire string) and a
+        // vendor-specific name satisfy the bundled OCPP 2.0.1
+        // SecurityEventNotification request JSON Schema, with techInfo present
+        // and omitted.
+        let validator = SchemaValidator::v201();
+        let cases: [(&str, Option<&str>); 4] = [
+            // A recommended event name, via the typed vocabulary (no typo risk).
+            (
+                SecurityEventType::InvalidFirmwareSignature.as_wire_str(),
+                Some("signature check failed at boot"),
+            ),
+            // Same recommended name, techInfo omitted.
+            (SecurityEventType::FirmwareUpdated.as_wire_str(), None),
+            // A vendor-specific event name outside the recommendation vocabulary.
+            ("VendorSpecific.CoolantLeak", Some("bay 3")),
+            // techInfo omitted on a vendor-specific name.
+            ("VendorSpecific.DoorAjar", None),
+        ];
+        for (event_type, tech_info) in cases {
+            let req = v201_security_event_notification_request(
+                event_type,
+                "2026-09-05T12:00:00Z",
+                tech_info,
+            );
+            let payload = serde_json::to_value(&req).unwrap();
+            validator
+                .validate_call("SecurityEventNotification", &payload)
+                .unwrap_or_else(|e| {
+                    panic!("built SecurityEventNotification request (type={event_type:?}, tech_info={tech_info:?}) is schema-valid, got: {e}")
+                });
+            assert!(payload.get("type").is_some());
+            assert!(payload.get("timestamp").is_some());
+        }
+    }
+
+    #[test]
+    fn security_event_type_as_wire_str_matches_serde() {
+        use ocpp_types::v201::SecurityEventType;
+
+        // `as_wire_str` must produce exactly the string serde emits for the
+        // variant, so the two paths (typed vocabulary vs. serialization) are
+        // interchangeable on the wire. Round-tripping the returned string back
+        // through serde to the same variant proves the literal is correct
+        // without hard-coding the expected strings a second time.
+        let all = [
+            SecurityEventType::FirmwareUpdated,
+            SecurityEventType::FailedToAuthenticateAtCsms,
+            SecurityEventType::CsmsFailedToAuthenticate,
+            SecurityEventType::SettingSystemTime,
+            SecurityEventType::StartupOfTheDevice,
+            SecurityEventType::ResetOrReboot,
+            SecurityEventType::SecurityLogWasCleared,
+            SecurityEventType::ReconfigurationOfSecurityParameters,
+            SecurityEventType::MemoryExhaustion,
+            SecurityEventType::InvalidMessages,
+            SecurityEventType::AttemptedReplayAttacks,
+            SecurityEventType::TamperDetectionActivated,
+            SecurityEventType::InvalidFirmwareSignature,
+            SecurityEventType::InvalidFirmwareSigningCertificate,
+            SecurityEventType::InvalidCsmsCertificate,
+            SecurityEventType::InvalidChargingStationCertificate,
+            SecurityEventType::InvalidTLSVersion,
+            SecurityEventType::InvalidTLSCipherSuite,
+            SecurityEventType::MaintenanceLoginAccepted,
+            SecurityEventType::MaintenanceLoginFailed,
+        ];
+        for evt in all {
+            let wire = evt.as_wire_str();
+            assert_eq!(
+                serde_json::to_value(evt).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "as_wire_str disagrees with serde for {evt:?}"
+            );
+            let back: SecurityEventType =
+                serde_json::from_value(serde_json::Value::String(wire.to_string())).unwrap();
+            assert_eq!(
+                back, evt,
+                "wire string {wire:?} does not round-trip to {evt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_event_notification_builder_does_not_parse_hostile_tech_info() {
+        // Trust boundary: techInfo is opaque caller text. An oversized / hostile
+        // value is copied through verbatim without panic or interpretation (no
+        // path handling, no decoding). The wire-level maxLength is a schema
+        // concern enforced by `call()`'s outbound validation, not the builder's.
+        let hostile = "../../etc/passwd\0${jndi:ldap://x}".repeat(1000);
+        let req = v201_security_event_notification_request(
+            "VendorSpecific.Probe",
+            "2026-09-05T12:00:00Z",
+            Some(&hostile),
+        );
+        assert_eq!(
+            req.tech_info.as_deref(),
+            Some(hostile.as_str()),
+            "the builder relays techInfo byte-for-byte and never interprets it"
+        );
     }
 
     // --- SetNetworkProfile (v201) decision + response builder (Issue #528) ---
