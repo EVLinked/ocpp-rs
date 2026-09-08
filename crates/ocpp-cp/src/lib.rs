@@ -108,6 +108,7 @@ use ocpp_messages::v201::{
     CostUpdatedRequest as V201CostUpdatedRequest,
     CustomerInformationRequest as V201CustomerInformationRequest,
     DataTransferRequest as V201DataTransferRequest,
+    DataTransferResponse as V201DataTransferResponse,
     DeleteCertificateRequest as V201DeleteCertificateRequest,
     Get15118EVCertificateResponse as V201Get15118EVCertificateResponse,
     GetBaseReportRequest as V201GetBaseReportRequest,
@@ -6811,6 +6812,82 @@ impl ChargePoint {
         Ok(())
     }
 
+    /// Originate a 2.0.1 `DataTransfer.req` — the **CP-initiated** vendor-specific
+    /// escape hatch the Charging Station uses to exchange data that no standard
+    /// OCPP 2.0.1 message covers (Issue #571).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.DataTransfer`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// The required `vendor_id` scopes the exchange, the optional `message_id`
+    /// names a specific message within that vendor's namespace, and the optional
+    /// free-form `data` (`Optional[Any]`, modelled as [`serde_json::Value`])
+    /// carries the payload. A real use case is a proprietary diagnostics ping, a
+    /// display-asset push, or an OEM battery-health report — the station
+    /// originates it here and branches on the CSMS's verdict.
+    ///
+    /// Unlike the ack-only notifications
+    /// ([`request_security_event_notification`](Self::request_security_event_notification),
+    /// [`request_notify_charging_limit`](Self::request_notify_charging_limit)),
+    /// `DataTransfer.conf` is **not** empty — so the full typed
+    /// [`DataTransferResponse`](V201DataTransferResponse) is returned rather than
+    /// `Ok(())`, giving the caller the
+    /// [`DataTransferStatusEnumType`](ocpp_types::v201::DataTransferStatusEnumType)
+    /// (`Accepted` / `Rejected` / `UnknownMessageId` / `UnknownVendorId`) plus any
+    /// returned `data` / `statusInfo`. A non-`Accepted` status is a valid
+    /// *protocol* outcome, surfaced as `Ok(..)` (not an `Err`); the response is
+    /// returned without panic on every status arm.
+    ///
+    /// Like the other CP-initiated hooks this is a **driver/sim hook** — called
+    /// from application or test code, not from inside the inbound-CALL dispatch
+    /// loop — so it emits the CALL inline via [`call`](Self::call), which
+    /// schema-validates both the outgoing request (rejecting an over-long
+    /// `vendor_id`/`message_id` as an `Err`, never a panic) and the incoming
+    /// `DataTransfer.conf` against the CP's 2.0.1 validator.
+    ///
+    /// Trust boundary: caller-supplied `data` is opaque payload — threaded to the
+    /// wire verbatim, never parsed as a path, decoded, or executed; the returned
+    /// `data` / `statusInfo` are likewise treated as opaque and never inspected.
+    /// The observability log records the `vendorId`, whether a `messageId` was
+    /// present, and the answered `status`, but never the `data` contents.
+    ///
+    /// V201-only: this hook drives only the 2.0.1 path, so a call on a `V16J`
+    /// station is refused with [`OcppError::NotSupported`] rather than putting a
+    /// 2.0.1 message on a 1.6J link (the same guard as the other CP-initiated
+    /// hooks; the 1.6J inbound `DataTransfer` registry is a separate seam). The
+    /// **inbound** v201 direction (the CP *answering* a CSMS-originated
+    /// `DataTransfer`) is out of scope here — this is the origination side only.
+    /// Transport/timeout/CALLERROR failures propagate as [`OcppError`].
+    pub async fn request_data_transfer(
+        &self,
+        vendor_id: &str,
+        message_id: Option<&str>,
+        data: Option<serde_json::Value>,
+    ) -> OcppResult<V201DataTransferResponse> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "DataTransfer is driven on the OCPP 2.0.1 path here; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let request = v201_command::v201_data_transfer_request(vendor_id, message_id, data);
+        let response = self.call(request).await?;
+
+        // Surface the outcome for observability without ever inspecting the opaque
+        // `data` payload (the vendor-extension trust boundary): log only the
+        // vendorId, whether a messageId was present, and the answered status.
+        info!(
+            vendor_id = %vendor_id,
+            message_id_present = message_id.is_some(),
+            status = ?response.status,
+            has_response_data = response.data.is_some(),
+            "originated DataTransfer; CSMS answered the vendor-specific exchange"
+        );
+
+        Ok(response)
+    }
+
     /// The version-specific half of [`start_transaction`](Self::start_transaction):
     /// send the protocol's "transaction opened" CALL and return the
     /// `transactionId` the rest of the flow keys its bookkeeping on.
@@ -12358,6 +12435,118 @@ mod tests {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         assert!(matches!(
             cp.request_get_certificate_status(sample_ocsp_request_data())
+                .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    // --- OCPP 2.0.1 DataTransfer CP-initiated driver hook (M7, #571) ---
+    // The station originates a vendor-specific `DataTransfer.req` and threads the
+    // CSMS's typed `.conf` (status + optional data / statusInfo) back through the
+    // outbound-request/response plumbing. Unlike the ack-only notifications the
+    // conf is non-empty, so the full typed response is surfaced. V201-only.
+
+    #[tokio::test]
+    async fn request_data_transfer_surfaces_an_accepted_conf_with_returned_data() {
+        use ocpp_types::v201::DataTransferStatusEnumType;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // An Accepted exchange may carry the vendor's own reply payload plus a
+        // statusInfo detail.
+        routes.insert(
+            "DataTransfer".to_string(),
+            serde_json::json!({
+                "status": "Accepted",
+                "data": {"echo": [1, 2, 3], "ok": true},
+                "statusInfo": {"reasonCode": "OK", "additionalInfo": "processed"}
+            }),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let resp = cp
+            .request_data_transfer(
+                "com.example.diag",
+                Some("ping"),
+                Some(serde_json::json!({"seq": 7})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, DataTransferStatusEnumType::Accepted);
+        assert_eq!(
+            resp.data,
+            Some(serde_json::json!({"echo": [1, 2, 3], "ok": true})),
+            "the vendor's returned data is surfaced verbatim, never parsed"
+        );
+        assert_eq!(
+            resp.status_info.as_ref().map(|s| s.reason_code.as_str()),
+            Some("OK"),
+            "statusInfo is surfaced when present"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_data_transfer_surfaces_every_non_accepted_status_without_panic() {
+        use ocpp_types::v201::DataTransferStatusEnumType;
+        // Rejected / UnknownMessageId / UnknownVendorId are all valid protocol
+        // outcomes, returned as `Ok(..)` (not `Err`) and surfaced without panic;
+        // a non-Accepted conf may omit `data` entirely.
+        let cases = [
+            ("Rejected", DataTransferStatusEnumType::Rejected),
+            (
+                "UnknownMessageId",
+                DataTransferStatusEnumType::UnknownMessageId,
+            ),
+            (
+                "UnknownVendorId",
+                DataTransferStatusEnumType::UnknownVendorId,
+            ),
+        ];
+        for (wire, expected) in cases {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert(
+                "BootNotification".to_string(),
+                boot_response("Accepted", 3600),
+            );
+            routes.insert(
+                "DataTransfer".to_string(),
+                serde_json::json!({"status": wire}),
+            );
+            let addr = spawn_mock_csms_routing(routes).await;
+            let cp = ChargePoint::new(ChargePointConfig {
+                central_system_url: format!("ws://{addr}"),
+                ..ChargePointConfig::for_version(OcppVersion::V201)
+            })
+            .unwrap();
+            cp.connect().await.unwrap();
+
+            let resp = cp
+                .request_data_transfer("com.unknown.vendor", None, None)
+                .await
+                .unwrap();
+            assert_eq!(resp.status, expected, "status {wire} surfaced");
+            assert!(
+                resp.data.is_none(),
+                "a {wire} conf without data surfaces None, not a panic"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_data_transfer_is_v201_only() {
+        // A 1.6J station is refused here rather than putting a 2.0.1 message on a
+        // 1.6J link (the 1.6J inbound DataTransfer registry is a separate seam).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_data_transfer("com.example.vendor", None, None)
                 .await,
             Err(OcppError::NotSupported { .. })
         ));
