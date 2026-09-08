@@ -6699,6 +6699,118 @@ impl ChargePoint {
         Ok(())
     }
 
+    /// Originate a 2.0.1 `NotifyChargingLimit.req` — the station's **unsolicited**
+    /// report that an *external* actor (a DSO/grid signal, an energy-management
+    /// system, or the CSO) has imposed a charging limit on it or a connected
+    /// EVSE (OCPP 2.0.1 Part 2, charging-limit management; Issue #564).
+    ///
+    /// The caller supplies the [`ChargingLimitType`](ocpp_types::v201::ChargingLimitType)
+    /// (the limit and its `chargingLimitSource`), an optional target `evse_id`
+    /// (absent = station-wide; the schema requires `> 0` when present), and the
+    /// optional resulting [`ChargingScheduleType`](ocpp_types::v201::ChargingScheduleType)s.
+    /// The `.conf` is empty (ack only), so a successful report surfaces as
+    /// `Ok(())`; this is the *notify* half of the imposed → cleared pair whose
+    /// *cleared* half is [`request_cleared_charging_limit`](Self::request_cleared_charging_limit).
+    ///
+    /// Because a pure simulator has no naturally-changing grid signal, the trip is
+    /// **deterministically injected** by the caller (application or test code),
+    /// matching the existing opt-in behavior-injection pattern. Like
+    /// [`request_security_event_notification`](Self::request_security_event_notification)
+    /// this is a **driver/sim hook**: it emits the CALL inline via
+    /// [`call`](Self::call) — which schema-validates both the outgoing request
+    /// (rejecting an `evse_id <= 0` or an empty `charging_schedule` as an `Err`,
+    /// never a panic) and the incoming empty `.conf` against the CP's 2.0.1
+    /// validator — with no receive-loop re-entrancy concern.
+    ///
+    /// V201-only: a call on a `V16J` station is refused with
+    /// [`OcppError::NotSupported`] rather than putting a 2.0.1 message on a 1.6J
+    /// link (the same guard as `request_security_event_notification`).
+    /// Transport/timeout/CALLERROR failures propagate as [`OcppError`].
+    pub async fn request_notify_charging_limit(
+        &self,
+        charging_limit: ocpp_types::v201::ChargingLimitType,
+        evse_id: Option<i32>,
+        charging_schedule: Option<Vec<ocpp_types::v201::ChargingScheduleType>>,
+    ) -> OcppResult<()> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "NotifyChargingLimit is driven on the OCPP 2.0.1 path; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let source = charging_limit.charging_limit_source;
+        let schedule_present = charging_schedule.is_some();
+        let request = v201_command::v201_notify_charging_limit_request(
+            charging_limit,
+            evse_id,
+            charging_schedule,
+        );
+        // The `.conf` is empty (ack only); `call()` still schema-validates it. We
+        // discard it and surface a bare `Ok(())` on a successful report.
+        let _ack = self.call(request).await?;
+
+        info!(
+            charging_limit_source = ?source,
+            evse_id = ?evse_id,
+            schedule_present,
+            "originated NotifyChargingLimit; CSMS acknowledged the imposed external charging limit"
+        );
+
+        Ok(())
+    }
+
+    /// Originate a 2.0.1 `ClearedChargingLimit.req` — the station's
+    /// **unsolicited** report that a previously-imposed *external* charging limit
+    /// is no longer in effect (OCPP 2.0.1 Part 2, charging-limit management;
+    /// Issue #564).
+    ///
+    /// The caller supplies the
+    /// [`ChargingLimitSourceEnumType`](ocpp_types::v201::ChargingLimitSourceEnumType)
+    /// whose limit was lifted (it should match the source the paired
+    /// [`request_notify_charging_limit`](Self::request_notify_charging_limit)
+    /// reported) and an optional target `evse_id` (absent = station-wide; the
+    /// schema requires `> 0` when present). The `.conf` is empty (ack only), so a
+    /// successful report surfaces as `Ok(())`; this is the *cleared* half of the
+    /// imposed → cleared pair.
+    ///
+    /// A **driver/sim hook** with the same discipline as
+    /// [`request_notify_charging_limit`](Self::request_notify_charging_limit): it
+    /// emits the CALL inline via [`call`](Self::call), which schema-validates the
+    /// outgoing request (rejecting an `evse_id <= 0` as an `Err`, never a panic)
+    /// and the incoming empty `.conf`.
+    ///
+    /// V201-only: a call on a `V16J` station is refused with
+    /// [`OcppError::NotSupported`]. Transport/timeout/CALLERROR failures propagate
+    /// as [`OcppError`].
+    pub async fn request_cleared_charging_limit(
+        &self,
+        charging_limit_source: ocpp_types::v201::ChargingLimitSourceEnumType,
+        evse_id: Option<i32>,
+    ) -> OcppResult<()> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "ClearedChargingLimit is driven on the OCPP 2.0.1 path; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let request =
+            v201_command::v201_cleared_charging_limit_request(charging_limit_source, evse_id);
+        // The `.conf` is empty (ack only); `call()` still schema-validates it.
+        let _ack = self.call(request).await?;
+
+        info!(
+            charging_limit_source = ?charging_limit_source,
+            evse_id = ?evse_id,
+            "originated ClearedChargingLimit; CSMS acknowledged the lifted external charging limit"
+        );
+
+        Ok(())
+    }
+
     /// The version-specific half of [`start_transaction`](Self::start_transaction):
     /// send the protocol's "transaction opened" CALL and return the
     /// `transactionId` the rest of the flow keys its bookkeeping on.
@@ -12540,6 +12652,141 @@ mod tests {
             cp.request_security_event_notification(
                 "StartupOfTheDevice",
                 "2026-09-05T12:00:00Z",
+                None
+            )
+            .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    // --- OCPP 2.0.1 NotifyChargingLimit / ClearedChargingLimit (M7, #564) --
+    // The station reports an external charging limit being imposed
+    // (`NotifyChargingLimit`) and later lifted (`ClearedChargingLimit`); the CSMS
+    // replies with an empty ack to each. These exercise the driver hooks against
+    // a mock CSMS returning `{}`.
+
+    fn notify_limit_sample() -> ocpp_types::v201::ChargingLimitType {
+        ocpp_types::v201::ChargingLimitType {
+            charging_limit_source: ocpp_types::v201::ChargingLimitSourceEnumType::So,
+            is_grid_critical: Some(true),
+            custom_data: None,
+        }
+    }
+
+    fn notify_limit_schedule() -> ocpp_types::v201::ChargingScheduleType {
+        use ocpp_types::v201::{ChargingRateUnitEnumType, ChargingSchedulePeriodType};
+        ocpp_types::v201::ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::A,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 16.0,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_notify_charging_limit_reports_and_returns_ok() {
+        // A station-wide imposed limit (no evseId, no schedule): the empty `.conf`
+        // is parsed and surfaced as `Ok(())` without panic.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert("NotifyChargingLimit".to_string(), serde_json::json!({}));
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.request_notify_charging_limit(notify_limit_sample(), None, None)
+            .await
+            .expect("the empty NotifyChargingLimit ack surfaces as Ok(())");
+    }
+
+    #[tokio::test]
+    async fn request_notify_charging_limit_with_evse_and_schedule_reports() {
+        // The full form — a per-EVSE limit carrying a resulting schedule — is
+        // equally accepted and surfaces as `Ok(())`.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert("NotifyChargingLimit".to_string(), serde_json::json!({}));
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.request_notify_charging_limit(
+            notify_limit_sample(),
+            Some(2),
+            Some(vec![notify_limit_schedule()]),
+        )
+        .await
+        .expect("a per-EVSE NotifyChargingLimit with a schedule reports successfully");
+    }
+
+    #[tokio::test]
+    async fn request_notify_charging_limit_is_v201_only() {
+        // NotifyChargingLimit is a 2.0.1 message: a 1.6J station is refused rather
+        // than putting a 2.0.1 message on a 1.6J link.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_notify_charging_limit(notify_limit_sample(), None, None)
+                .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_cleared_charging_limit_reports_and_returns_ok() {
+        // The paired clear: an external limit is lifted station-wide; the empty
+        // `.conf` surfaces as `Ok(())`.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert("ClearedChargingLimit".to_string(), serde_json::json!({}));
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.request_cleared_charging_limit(
+            ocpp_types::v201::ChargingLimitSourceEnumType::So,
+            Some(2),
+        )
+        .await
+        .expect("the empty ClearedChargingLimit ack surfaces as Ok(())");
+    }
+
+    #[tokio::test]
+    async fn request_cleared_charging_limit_is_v201_only() {
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_cleared_charging_limit(
+                ocpp_types::v201::ChargingLimitSourceEnumType::Ems,
                 None
             )
             .await,
