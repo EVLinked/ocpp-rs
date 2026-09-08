@@ -1349,7 +1349,7 @@ pub struct ChargePoint {
     /// (starting at `1`; `0` is avoided so an unset id is never confused with a
     /// real one), so every reported event is individually addressable and may be
     /// referenced as another event's `cause`. Shared behind an `Arc<AtomicI32>`
-    /// for the same reason as [`next_notify_event_seq_no`](Self::next_notify_event_seq_no).
+    /// for the same reason as `next_notify_event_seq_no`.
     next_notify_event_id: Arc<AtomicI32>,
 }
 
@@ -6786,7 +6786,7 @@ impl ChargePoint {
     /// - the reported `actual_value`.
     ///
     /// All matched monitors ride one `NotifyEvent` page, stamped with the next
-    /// monotonic `seqNo` (see [`next_notify_event_seq_no`](Self::next_notify_event_seq_no)).
+    /// monotonic `seqNo` (see the `next_notify_event_seq_no` field).
     ///
     /// # Outcome
     ///

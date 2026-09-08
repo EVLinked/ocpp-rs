@@ -138,7 +138,7 @@ struct MonitorEntry {
 
 /// One installed variable monitor that a
 /// [`trip`](V201DeviceModel::monitors_for_variable) matched — the minimal
-/// projection of a [`MonitorEntry`] a `NotifyEvent` emitter needs to build a
+/// projection of a `MonitorEntry` a `NotifyEvent` emitter needs to build a
 /// schema-valid `EventDataType`: the monitor's station-assigned `id` (the
 /// `variableMonitoringId` correlation), its `kind` (which the emitter maps to an
 /// `EventTriggerEnumType`), and the **display-form** component / variable so the
@@ -757,7 +757,7 @@ impl V201DeviceModel {
     /// makes when a monitor trips.
     ///
     /// The match is by the same **case-insensitive**, name+instance-normalized
-    /// [`VariableKey`] the install / snapshot paths use, so `OCPPCommCtrlr` and
+    /// `VariableKey` the install / snapshot paths use, so `OCPPCommCtrlr` and
     /// ` occppcommctrlr ` address the same monitors. The trip seam addresses a
     /// variable by name only (no component instance / EVSE and no variable
     /// instance), matching monitors installed on the station-wide, un-instanced
