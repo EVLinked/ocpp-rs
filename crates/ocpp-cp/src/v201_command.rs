@@ -167,10 +167,10 @@ use ocpp_types::v201::{
     CancelReservationStatusEnumType, CertificateActionEnumType, CertificateHashDataChainType,
     CertificateHashDataType, CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
     ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingLimitType,
-    ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
-    ChargingProfileType, ChargingScheduleType, ClearCacheStatusEnumType,
-    ClearChargingProfileStatusEnumType, ClearChargingProfileType, ClearMessageStatusEnumType,
-    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    ChargingNeedsType, ChargingProfileCriterionType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, ChargingProfileType, ChargingScheduleType,
+    ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
+    ClearMessageStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
     DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
     GenericStatusEnumType, GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
     GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
@@ -192,9 +192,9 @@ use ocpp_messages::v201::{
     GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
     GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
     LogStatusNotificationRequest, NotifyChargingLimitRequest, NotifyCustomerInformationRequest,
-    NotifyDisplayMessagesRequest, PublishFirmwareRequest, PublishFirmwareResponse,
-    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse,
+    NotifyDisplayMessagesRequest, NotifyEVChargingNeedsRequest, NotifyEVChargingScheduleRequest,
+    PublishFirmwareRequest, PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
     SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
@@ -2642,6 +2642,82 @@ pub fn v201_get_15118_ev_certificate_request(
         iso15118_schema_version: iso15118_schema_version.to_string(),
         action,
         exi_request: exi_request.to_string(),
+        custom_data: None,
+    }
+}
+
+/// Build a `NotifyEVChargingNeeds.req` ([`NotifyEVChargingNeedsRequest`]) — the
+/// **CP-initiated** report of the charging needs an EV expressed over ISO 15118
+/// (Part 2, smart charging; Issue #567), the first leg of the needs→schedule
+/// negotiation.
+///
+/// Ports [`ocpp.v201.call.NotifyEVChargingNeeds`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// When an EV declares its energy requirements, the station forwards the EV's
+/// [`ChargingNeedsType`] (its requested
+/// [`EnergyTransferModeEnumType`](ocpp_types::v201::EnergyTransferModeEnumType), optional
+/// departure time, and AC **or** DC charging parameters) for a given `evseId` so
+/// the CSMS can compute a schedule; the CSMS acks with a
+/// [`NotifyEVChargingNeedsStatusEnumType`](ocpp_types::v201::NotifyEVChargingNeedsStatusEnumType)
+/// (`Accepted` / `Rejected` / `Processing`).
+///
+/// `charging_needs` and `evse_id` are threaded through **verbatim** and
+/// `max_schedule_tuples` (the maximum number of schedule tuples the EV supports)
+/// is optional — omitted from the wire when `None`, never serialized as `null`.
+/// The builder adds no policy: per the spec `evseId` may not be `0`, but the
+/// bundled schema encodes `evseId` only as `type: integer` (the "may not be 0"
+/// is prose, not a `minimum`), so that invariant is enforced one layer up in
+/// [`ChargePoint::request_notify_ev_charging_needs`](crate::ChargePoint::request_notify_ev_charging_needs),
+/// not here. The charging-parameter numeric fields ride as their typed integer
+/// values and are never parsed as anything else.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or
+/// a socket; emitting it as a CALL and surfacing the response status is the
+/// wiring layer's job.
+#[must_use]
+pub fn v201_notify_ev_charging_needs_request(
+    charging_needs: ChargingNeedsType,
+    evse_id: i32,
+    max_schedule_tuples: Option<i32>,
+) -> NotifyEVChargingNeedsRequest {
+    NotifyEVChargingNeedsRequest {
+        charging_needs,
+        evse_id,
+        max_schedule_tuples,
+        custom_data: None,
+    }
+}
+
+/// Build a `NotifyEVChargingSchedule.req` ([`NotifyEVChargingScheduleRequest`]) —
+/// the **CP-initiated** report of the charging schedule an EV communicated to
+/// the station (Part 2, smart charging; Issue #567), the second leg of the
+/// needs→schedule negotiation.
+///
+/// Ports [`ocpp.v201.call.NotifyEVChargingSchedule`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// The station reports the [`ChargingScheduleType`] the EV intends to follow,
+/// with its periods relative to `time_base` (an RFC 3339 instant) for a given
+/// `evseId`; the CSMS acks with a shared
+/// [`GenericStatusEnumType`] (`Accepted`
+/// / `Rejected`) that reports only whether it could process the message — not
+/// approval of the schedule.
+///
+/// All three fields are threaded through **verbatim** — the builder adds no
+/// policy. As with the needs builder, the spec's `evseId > 0` invariant is
+/// documented in prose (not a schema `minimum`) and is enforced in
+/// [`ChargePoint::request_notify_ev_charging_schedule`](crate::ChargePoint::request_notify_ev_charging_schedule),
+/// not here.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or
+/// a socket.
+#[must_use]
+pub fn v201_notify_ev_charging_schedule_request(
+    time_base: &str,
+    charging_schedule: ChargingScheduleType,
+    evse_id: i32,
+) -> NotifyEVChargingScheduleRequest {
+    NotifyEVChargingScheduleRequest {
+        time_base: time_base.to_string(),
+        charging_schedule,
+        evse_id,
         custom_data: None,
     }
 }
@@ -6640,6 +6716,189 @@ mod tests {
             assert!(payload.get("action").is_some());
             assert!(payload.get("exiRequest").is_some());
         }
+    }
+
+    // --- NotifyEVChargingNeeds / NotifyEVChargingSchedule (v201) CP-initiated
+    //     request builders (Issue #567) ---
+
+    #[test]
+    fn notify_ev_charging_needs_request_threads_its_fields_verbatim() {
+        use ocpp_types::v201::{ACChargingParametersType, EnergyTransferModeEnumType};
+        let needs = ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::AcSinglePhase,
+            departure_time: Some("2022-01-01T12:00:00Z".to_string()),
+            ac_charging_parameters: Some(ACChargingParametersType {
+                energy_amount: 20000,
+                ev_min_current: 6,
+                ev_max_current: 32,
+                ev_max_voltage: 230,
+                custom_data: None,
+            }),
+            dc_charging_parameters: None,
+            custom_data: None,
+        };
+        let req = v201_notify_ev_charging_needs_request(needs.clone(), 2, Some(4));
+        assert_eq!(req.charging_needs, needs);
+        assert_eq!(req.evse_id, 2);
+        assert_eq!(req.max_schedule_tuples, Some(4));
+        assert!(
+            req.custom_data.is_none(),
+            "the builder attaches no vendor extension"
+        );
+    }
+
+    #[test]
+    fn notify_ev_charging_needs_omits_max_schedule_tuples_when_none() {
+        use ocpp_types::v201::EnergyTransferModeEnumType;
+        let needs = ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::AcThreePhase,
+            departure_time: None,
+            ac_charging_parameters: None,
+            dc_charging_parameters: None,
+            custom_data: None,
+        };
+        let req = v201_notify_ev_charging_needs_request(needs, 1, None);
+        let wire = serde_json::to_value(&req).unwrap();
+        // Omitted, never serialized as `null`.
+        assert!(
+            !wire.as_object().unwrap().contains_key("maxScheduleTuples"),
+            "maxScheduleTuples is absent on the wire when None, not null: {wire}"
+        );
+        assert!(!wire.as_object().unwrap().contains_key("customData"));
+    }
+
+    #[test]
+    fn built_notify_ev_charging_needs_requests_are_schema_valid() {
+        // Both the AC and DC charging-parameter shapes, with and without the
+        // optional maxScheduleTuples, satisfy the bundled OCPP 2.0.1
+        // NotifyEVChargingNeeds request JSON Schema.
+        use ocpp_types::v201::{
+            ACChargingParametersType, DCChargingParametersType, EnergyTransferModeEnumType,
+        };
+        let validator = SchemaValidator::v201();
+
+        let ac_needs = ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::AcSinglePhase,
+            departure_time: Some("2022-01-01T12:00:00Z".to_string()),
+            ac_charging_parameters: Some(ACChargingParametersType {
+                energy_amount: 20000,
+                ev_min_current: 6,
+                ev_max_current: 32,
+                ev_max_voltage: 230,
+                custom_data: None,
+            }),
+            dc_charging_parameters: None,
+            custom_data: None,
+        };
+        let dc_needs = ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::Dc,
+            departure_time: None,
+            ac_charging_parameters: None,
+            dc_charging_parameters: Some(DCChargingParametersType {
+                ev_max_current: 400,
+                ev_max_voltage: 900,
+                energy_amount: Some(60000),
+                ev_max_power: Some(150000),
+                state_of_charge: Some(20),
+                ev_energy_capacity: Some(80000),
+                full_soc: Some(100),
+                bulk_soc: Some(80),
+                custom_data: None,
+            }),
+            custom_data: None,
+        };
+
+        for (label, needs, max_tuples) in [
+            ("ac+maxTuples", ac_needs, Some(4)),
+            ("dc-only", dc_needs, None),
+        ] {
+            let req = v201_notify_ev_charging_needs_request(needs, 1, max_tuples);
+            let wire = serde_json::to_value(&req).unwrap();
+            validator
+                .validate_call("NotifyEVChargingNeeds", &wire)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "built NotifyEVChargingNeeds request ({label}) is schema-valid, got: {e}"
+                    )
+                });
+            // Required fields always present; evseId rides as a positive integer.
+            assert!(wire.get("chargingNeeds").is_some());
+            assert_eq!(wire["evseId"], serde_json::json!(1));
+            assert!(wire["evseId"].is_i64());
+        }
+    }
+
+    #[test]
+    fn notify_ev_charging_schedule_request_threads_its_fields_verbatim() {
+        use ocpp_types::v201::{ChargingRateUnitEnumType, ChargingSchedulePeriodType};
+        let schedule = ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::A,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 16.0,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        };
+        let req =
+            v201_notify_ev_charging_schedule_request("2022-01-01T10:00:00Z", schedule.clone(), 3);
+        assert_eq!(req.time_base, "2022-01-01T10:00:00Z");
+        assert_eq!(req.charging_schedule, schedule);
+        assert_eq!(req.evse_id, 3);
+        assert!(req.custom_data.is_none());
+    }
+
+    #[test]
+    fn built_notify_ev_charging_schedule_requests_are_schema_valid() {
+        // A non-empty schedule anchored to a timeBase satisfies the bundled OCPP
+        // 2.0.1 NotifyEVChargingSchedule request JSON Schema.
+        use ocpp_types::v201::{ChargingRateUnitEnumType, ChargingSchedulePeriodType};
+        let validator = SchemaValidator::v201();
+        let schedule = ChargingScheduleType {
+            id: 7,
+            charging_rate_unit: ChargingRateUnitEnumType::W,
+            charging_schedule_period: vec![
+                ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 11000.0,
+                    number_phases: Some(3),
+                    phase_to_use: None,
+                    custom_data: None,
+                },
+                ChargingSchedulePeriodType {
+                    start_period: 1800,
+                    limit: 7000.0,
+                    number_phases: None,
+                    phase_to_use: None,
+                    custom_data: None,
+                },
+            ],
+            start_schedule: None,
+            duration: Some(3600),
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        };
+        let req = v201_notify_ev_charging_schedule_request("2022-01-01T10:00:00Z", schedule, 2);
+        let wire = serde_json::to_value(&req).unwrap();
+        validator
+            .validate_call("NotifyEVChargingSchedule", &wire)
+            .unwrap_or_else(|e| {
+                panic!("built NotifyEVChargingSchedule request is schema-valid, got: {e}")
+            });
+        assert_eq!(wire["timeBase"], serde_json::json!("2022-01-01T10:00:00Z"));
+        assert_eq!(wire["evseId"], serde_json::json!(2));
+        assert!(!wire["chargingSchedule"]["chargingSchedulePeriod"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     // --- SecurityEventNotification (v201) CP-initiated request builder (Issue #562) ---
