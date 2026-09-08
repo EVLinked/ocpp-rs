@@ -6708,7 +6708,7 @@ impl ChargePoint {
     /// The caller supplies the [`ChargingLimitType`](ocpp_types::v201::ChargingLimitType)
     /// (the limit and its `chargingLimitSource`), an optional target `evse_id`
     /// (absent = station-wide; the schema requires `> 0` when present), and the
-    /// optional resulting [`ChargingScheduleType`](ocpp_types::v201::ChargingScheduleType)s.
+    /// optional resulting [`ChargingScheduleType`]s.
     /// The `.conf` is empty (ack only), so a successful report surfaces as
     /// `Ok(())`; this is the *notify* half of the imposed → cleared pair whose
     /// *cleared* half is [`request_cleared_charging_limit`](Self::request_cleared_charging_limit).

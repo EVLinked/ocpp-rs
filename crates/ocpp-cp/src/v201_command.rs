@@ -2856,7 +2856,9 @@ pub fn v201_cleared_charging_limit_request(
 /// a required `vendorId` scopes the exchange, an optional `messageId` names a
 /// specific message within that vendor's namespace, and an optional free-form
 /// `data` carries the payload. Unlike the ack-only notifications, the `.conf`
-/// here is non-empty (a [`DataTransferStatusEnumType`] plus its own optional
+/// here is non-empty (a
+/// [`DataTransferStatusEnumType`](ocpp_types::v201::DataTransferStatusEnumType)
+/// plus its own optional
 /// `data`); surfacing it is the wiring layer's job
 /// ([`ChargePoint::request_data_transfer`](crate::ChargePoint::request_data_transfer)).
 ///
