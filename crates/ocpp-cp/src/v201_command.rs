@@ -170,17 +170,19 @@ use ocpp_types::v201::{
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ChargingScheduleType, ClearCacheStatusEnumType,
     ClearChargingProfileStatusEnumType, ClearChargingProfileType, ClearMessageStatusEnumType,
-    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
-    DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
+    ComponentType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    DisplayMessageStatusEnumType, EventDataType, EventNotificationEnumType, EventTriggerEnumType,
+    FirmwareStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
+    GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
     GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
     LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
-    MessageTriggerEnumType, OCSPRequestDataType, OperationalStatusEnumType,
+    MessageTriggerEnumType, MonitorEnumType, OCSPRequestDataType, OperationalStatusEnumType,
     PublishFirmwareStatusEnumType, RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType,
     ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
     StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
     UnpublishFirmwareStatusEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    VariableType,
 };
 
 use ocpp_messages::v201::{
@@ -192,9 +194,9 @@ use ocpp_messages::v201::{
     GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse, GetMonitoringReportResponse,
     GetTransactionStatusResponse, InstallCertificateResponse, LogStatusNotificationRequest,
     NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest, NotifyEVChargingNeedsRequest,
-    NotifyEVChargingScheduleRequest, PublishFirmwareRequest, PublishFirmwareResponse,
-    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse,
+    NotifyEVChargingScheduleRequest, NotifyEventRequest, PublishFirmwareRequest,
+    PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
     SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
@@ -2764,6 +2766,117 @@ pub fn v201_security_event_notification_request(
         event_type: event_type.to_string(),
         timestamp: timestamp.to_string(),
         tech_info: tech_info.map(str::to_string),
+        custom_data: None,
+    }
+}
+
+/// Map the [`MonitorEnumType`] of a tripped variable monitor to the
+/// [`EventTriggerEnumType`] a `NotifyEvent` reports for it.
+///
+/// Ports the `MonitorType → EventTriggerEnumType` correspondence implied by
+/// `ocpp/v201/enums.py`: the five monitor kinds collapse onto the three event
+/// triggers.
+///
+/// - `UpperThreshold` / `LowerThreshold` → [`Alerting`](EventTriggerEnumType::Alerting):
+///   a threshold crossing is an alert condition.
+/// - `Delta` → [`Delta`](EventTriggerEnumType::Delta).
+/// - `Periodic` / `PeriodicClockAligned` → [`Periodic`](EventTriggerEnumType::Periodic):
+///   both are periodic reports; the event trigger does not distinguish
+///   clock-alignment.
+///
+/// The match is exhaustive without a wildcard, so a newly-added monitor kind is
+/// a compile error to triage here rather than a silent mis-mapping.
+#[must_use]
+pub fn v201_event_trigger_for_monitor(kind: MonitorEnumType) -> EventTriggerEnumType {
+    match kind {
+        MonitorEnumType::UpperThreshold | MonitorEnumType::LowerThreshold => {
+            EventTriggerEnumType::Alerting
+        }
+        MonitorEnumType::Delta => EventTriggerEnumType::Delta,
+        MonitorEnumType::Periodic | MonitorEnumType::PeriodicClockAligned => {
+            EventTriggerEnumType::Periodic
+        }
+    }
+}
+
+/// Build one `EventDataType` for a tripped variable monitor.
+///
+/// Ports [`ocpp.v201.datatypes.EventDataType`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/datatypes.py)
+/// for the CSMS-installed-monitor case: the event carries a unique `event_id`,
+/// the `timestamp` the trip was observed, the `trigger` derived from the
+/// monitor kind ([`v201_event_trigger_for_monitor`]), the reported
+/// `actual_value`, an [`EventNotificationEnumType::CustomMonitor`] notification
+/// type (the monitor was installed by the CSMS via `SetVariableMonitoring`, not
+/// hard-wired or preconfigured), the monitor's `component` / `variable`, and the
+/// `variable_monitoring_id` correlating the event back to the monitor.
+///
+/// `actual_value` is **opaque, caller-supplied** text — the reported value of
+/// the variable at the moment of the trip. It is copied onto the wire verbatim,
+/// never parsed as a number, decoded, or executed (the schema types it as a
+/// `string`, `maxLength: 2500`, enforced by the outbound validation in
+/// [`ChargePoint::call`](crate::ChargePoint::call), which surfaces an over-long
+/// value as an `Err`, never a panic). The elaborating fields (`cause`,
+/// `tech_code`, `tech_info`, `cleared`, `transaction_id`) are omitted: a
+/// simulator-injected trip carries no diagnostic chain.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime.
+#[must_use]
+pub fn v201_monitor_event_data(
+    event_id: i32,
+    timestamp: &str,
+    monitor_kind: MonitorEnumType,
+    actual_value: &str,
+    component: ComponentType,
+    variable: VariableType,
+    variable_monitoring_id: i32,
+) -> EventDataType {
+    EventDataType {
+        event_id,
+        timestamp: timestamp.to_string(),
+        trigger: v201_event_trigger_for_monitor(monitor_kind),
+        actual_value: actual_value.to_string(),
+        event_notification_type: EventNotificationEnumType::CustomMonitor,
+        component,
+        variable,
+        cause: None,
+        tech_code: None,
+        tech_info: None,
+        cleared: None,
+        transaction_id: None,
+        variable_monitoring_id: Some(variable_monitoring_id),
+        custom_data: None,
+    }
+}
+
+/// Build a `NotifyEvent.req` ([`NotifyEventRequest`]) — the **CP-initiated**
+/// device-model event stream the Charging Station pushes to the CSMS (Part 2,
+/// monitoring; Issue #545).
+///
+/// Ports [`ocpp.v201.call.NotifyEvent`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// When one or more installed variable monitors trip, the station reports the
+/// resulting [`EventDataType`] events, tagged with the message `generated_at`
+/// instant and a monotonic `seq_no`. This builder emits a single page (`tbc`
+/// omitted = `false`): the simulator trips a small, bounded set of monitors per
+/// event, well within one frame. Multi-page `tbc` chunking is a later slice if
+/// the per-trip event set ever outgrows a frame — mirroring the single-page
+/// stance of the `NotifyMonitoringReport` seam.
+///
+/// `event_data` is threaded through **verbatim**; the schema requires at least
+/// one item, an invariant the caller
+/// ([`ChargePoint::trip_variable_monitor`](crate::ChargePoint::trip_variable_monitor))
+/// upholds by not emitting when no monitor matched. Pure over its input, so it
+/// is unit- and schema-testable without a runtime or a socket.
+#[must_use]
+pub fn v201_notify_event_request(
+    generated_at: &str,
+    seq_no: i32,
+    event_data: Vec<EventDataType>,
+) -> NotifyEventRequest {
+    NotifyEventRequest {
+        generated_at: generated_at.to_string(),
+        seq_no,
+        event_data,
+        tbc: None,
         custom_data: None,
     }
 }
@@ -8224,5 +8337,147 @@ mod tests {
                 .validate_call_result("UnpublishFirmware", &serde_json::to_value(&resp).unwrap())
                 .expect("built UnpublishFirmware response is schema-valid");
         }
+    }
+
+    // --- NotifyEvent (v201) variable-monitor-trip builders (Issue #545) ---
+
+    #[test]
+    fn notify_event_trigger_derivation_maps_each_monitor_kind() {
+        // Every stored monitor kind collapses onto the correct event trigger; the
+        // five kinds partition onto the three triggers. Exhaustive so a new kind
+        // is caught here.
+        assert_eq!(
+            v201_event_trigger_for_monitor(MonitorEnumType::UpperThreshold),
+            EventTriggerEnumType::Alerting
+        );
+        assert_eq!(
+            v201_event_trigger_for_monitor(MonitorEnumType::LowerThreshold),
+            EventTriggerEnumType::Alerting
+        );
+        assert_eq!(
+            v201_event_trigger_for_monitor(MonitorEnumType::Delta),
+            EventTriggerEnumType::Delta
+        );
+        assert_eq!(
+            v201_event_trigger_for_monitor(MonitorEnumType::Periodic),
+            EventTriggerEnumType::Periodic
+        );
+        assert_eq!(
+            v201_event_trigger_for_monitor(MonitorEnumType::PeriodicClockAligned),
+            EventTriggerEnumType::Periodic
+        );
+    }
+
+    fn sample_component_variable() -> (ComponentType, VariableType) {
+        (
+            ComponentType {
+                name: "OCPPCommCtrlr".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            VariableType {
+                name: "HeartbeatInterval".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+        )
+    }
+
+    #[test]
+    fn built_monitor_event_data_correlates_and_carries_custom_monitor_type() {
+        // The event carries the derived trigger, the CSMS-installed notification
+        // type, the monitor-id correlation, and the reported value — with the
+        // diagnostic-chain fields left unset.
+        let (component, variable) = sample_component_variable();
+        let event = v201_monitor_event_data(
+            7,
+            "2022-01-01T10:00:00Z",
+            MonitorEnumType::Delta,
+            "42.5",
+            component.clone(),
+            variable.clone(),
+            3,
+        );
+        assert_eq!(event.event_id, 7);
+        assert_eq!(event.trigger, EventTriggerEnumType::Delta);
+        assert_eq!(
+            event.event_notification_type,
+            EventNotificationEnumType::CustomMonitor
+        );
+        assert_eq!(event.variable_monitoring_id, Some(3));
+        assert_eq!(event.actual_value, "42.5");
+        assert_eq!(event.component, component);
+        assert_eq!(event.variable, variable);
+        // A simulator-injected trip carries no diagnostic chain.
+        assert!(event.cause.is_none());
+        assert!(event.tech_code.is_none());
+        assert!(event.tech_info.is_none());
+        assert!(event.cleared.is_none());
+        assert!(event.transaction_id.is_none());
+    }
+
+    #[test]
+    fn built_notify_event_requests_are_schema_valid() {
+        // A NotifyEvent carrying one event per monitor kind satisfies the bundled
+        // OCPP 2.0.1 NotifyEvent request JSON Schema.
+        let validator = SchemaValidator::v201();
+        let (component, variable) = sample_component_variable();
+        let event_data: Vec<_> = [
+            MonitorEnumType::UpperThreshold,
+            MonitorEnumType::LowerThreshold,
+            MonitorEnumType::Delta,
+            MonitorEnumType::Periodic,
+            MonitorEnumType::PeriodicClockAligned,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            v201_monitor_event_data(
+                i as i32 + 1,
+                "2022-01-01T10:00:00Z",
+                kind,
+                "some-value",
+                component.clone(),
+                variable.clone(),
+                i as i32 + 1,
+            )
+        })
+        .collect();
+        let req = v201_notify_event_request("2022-01-01T10:00:00Z", 0, event_data);
+        // Single page: `tbc` and `customData` are omitted from the wire.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(!wire.as_object().unwrap().contains_key("tbc"));
+        assert!(!wire.as_object().unwrap().contains_key("customData"));
+        validator
+            .validate_call("NotifyEvent", &wire)
+            .expect("built NotifyEvent request is schema-valid");
+    }
+
+    #[test]
+    fn notify_event_with_oversized_actual_value_is_schema_rejected_not_panicked() {
+        // Trust boundary: an oversized `actualValue` (the schema caps it at 2500)
+        // is *rejected* by validation, never a panic or a silent truncation — the
+        // builder threads it through verbatim and the wire bound catches it.
+        let validator = SchemaValidator::v201();
+        let (component, variable) = sample_component_variable();
+        let oversized = "x".repeat(2501);
+        let event = v201_monitor_event_data(
+            1,
+            "2022-01-01T10:00:00Z",
+            MonitorEnumType::Delta,
+            &oversized,
+            component,
+            variable,
+            1,
+        );
+        // The builder did not truncate — the value survives verbatim.
+        assert_eq!(event.actual_value.len(), 2501);
+        let req = v201_notify_event_request("2022-01-01T10:00:00Z", 0, vec![event]);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(
+            validator.validate_call("NotifyEvent", &wire).is_err(),
+            "an over-2500-char actualValue must fail schema validation, not slip through"
+        );
     }
 }

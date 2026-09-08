@@ -136,6 +136,32 @@ struct MonitorEntry {
     monitor: VariableMonitoringType,
 }
 
+/// One installed variable monitor that a
+/// [`trip`](V201DeviceModel::monitors_for_variable) matched — the minimal
+/// projection of a [`MonitorEntry`] a `NotifyEvent` emitter needs to build a
+/// schema-valid `EventDataType`: the monitor's station-assigned `id` (the
+/// `variableMonitoringId` correlation), its `kind` (which the emitter maps to an
+/// `EventTriggerEnumType`), and the **display-form** component / variable so the
+/// streamed event reproduces the CSMS-visible names (`OCPPCommCtrlr`, not the
+/// lowercased lookup key).
+///
+/// Owned (cloned off the store) so the caller can drop the read lock before
+/// emitting the outbound CALL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrippedMonitor {
+    /// The monitor's station-assigned id — carried on the event as
+    /// `variableMonitoringId` so the CSMS correlates the event to the monitor it
+    /// installed.
+    pub id: i32,
+    /// The monitor kind (`Delta` / `Periodic` / `UpperThreshold` / …). The
+    /// emitter derives the event's `EventTriggerEnumType` from it.
+    pub kind: MonitorEnumType,
+    /// The component in its CSMS-visible casing.
+    pub component: ComponentType,
+    /// The variable in its CSMS-visible casing.
+    pub variable: VariableType,
+}
+
 /// The most permissive monitoring reporting level (`9`, Debug). Every installed
 /// monitor's severity is in `0..=9`, so at this level nothing is suppressed. The
 /// device model's default until a CSMS narrows it via `SetMonitoringLevel`.
@@ -724,6 +750,53 @@ impl V201DeviceModel {
             .collect();
         Self::sort_monitoring(&mut snapshot);
         snapshot
+    }
+
+    /// Every installed monitor watching the (`component`, `variable`) identity,
+    /// as a [`TrippedMonitor`] projection — the read the `NotifyEvent` emitter
+    /// makes when a monitor trips.
+    ///
+    /// The match is by the same **case-insensitive**, name+instance-normalized
+    /// [`VariableKey`] the install / snapshot paths use, so `OCPPCommCtrlr` and
+    /// ` occppcommctrlr ` address the same monitors. The trip seam addresses a
+    /// variable by name only (no component instance / EVSE and no variable
+    /// instance), matching monitors installed on the station-wide, un-instanced
+    /// identity — the standard-profile variables the simulator seeds. A variable
+    /// may carry several monitors (a `Delta` **and** a `Periodic`, say); all of
+    /// them are returned, **sorted by id** so the emitted event order is
+    /// deterministic and independent of `HashMap` iteration.
+    ///
+    /// An empty result means no monitor watches that identity — the caller emits
+    /// nothing (a no-op trip), never a panic.
+    pub fn monitors_for_variable(&self, component: &str, variable: &str) -> Vec<TrippedMonitor> {
+        // Build the lookup key through the same normalization as install /
+        // snapshot, from a name-only component / variable (no instance, no EVSE).
+        let component_ty = ComponentType {
+            name: component.to_string(),
+            instance: None,
+            evse: None,
+            custom_data: None,
+        };
+        let variable_ty = VariableType {
+            name: variable.to_string(),
+            instance: None,
+            custom_data: None,
+        };
+        let key = VariableKey::from_request(&component_ty, &variable_ty);
+
+        let mut matches: Vec<TrippedMonitor> = self
+            .monitors
+            .values()
+            .filter(|entry| entry.key == key)
+            .map(|entry| TrippedMonitor {
+                id: entry.monitor.id,
+                kind: entry.monitor.kind,
+                component: entry.component.clone(),
+                variable: entry.variable.clone(),
+            })
+            .collect();
+        matches.sort_by_key(|m| m.id);
+        matches
     }
 
     /// Whether a monitor of the given [`MonitorEnumType`] falls under a requested
@@ -2157,5 +2230,45 @@ mod tests {
             MonitorBaseEnumType::FactoryDefault,
             "a NotSupported base leaves the stored selection unchanged",
         );
+    }
+
+    #[test]
+    fn monitors_for_variable_matches_case_insensitively_and_sorts_by_id() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        // Two monitors on the same variable → two matches, id-sorted.
+        let results = model.install_monitors(&[
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Delta,
+                1.0,
+                3,
+            ),
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Periodic,
+                900.0,
+                5,
+            ),
+        ]);
+        assert!(results
+            .iter()
+            .all(|r| r.status == SetMonitoringStatusEnumType::Accepted));
+
+        // Name-only, case-insensitive lookup returns both, sorted by id, in their
+        // CSMS-visible casing.
+        let found = model.monitors_for_variable("ocppcommctrlr", "heartbeatinterval");
+        assert_eq!(found.len(), 2);
+        assert!(found[0].id < found[1].id);
+        assert_eq!(found[0].kind, MonitorEnumType::Delta);
+        assert_eq!(found[1].kind, MonitorEnumType::Periodic);
+        assert_eq!(found[0].component.name, "OCPPCommCtrlr");
+        assert_eq!(found[0].variable.name, "HeartbeatInterval");
+
+        // A variable no monitor watches → no matches (a no-op trip).
+        assert!(model
+            .monitors_for_variable("OCPPCommCtrlr", "NoSuchVariable")
+            .is_empty());
     }
 }
