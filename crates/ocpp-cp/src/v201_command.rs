@@ -189,15 +189,15 @@ use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
     ClearedChargingLimitRequest, CostUpdatedResponse, CustomerInformationRequest,
-    CustomerInformationResponse, DeleteCertificateResponse, FirmwareStatusNotificationRequest,
-    Get15118EVCertificateRequest, GetCertificateStatusRequest, GetChargingProfilesResponse,
-    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
-    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    LogStatusNotificationRequest, NotifyChargingLimitRequest, NotifyCustomerInformationRequest,
-    NotifyDisplayMessagesRequest, NotifyEVChargingNeedsRequest, NotifyEVChargingScheduleRequest,
-    NotifyEventRequest, PublishFirmwareRequest, PublishFirmwareResponse,
-    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse,
+    CustomerInformationResponse, DataTransferRequest, DeleteCertificateResponse,
+    FirmwareStatusNotificationRequest, Get15118EVCertificateRequest, GetCertificateStatusRequest,
+    GetChargingProfilesResponse, GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse,
+    GetLogRequest, GetLogResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
+    InstallCertificateResponse, LogStatusNotificationRequest, NotifyChargingLimitRequest,
+    NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest, NotifyEVChargingNeedsRequest,
+    NotifyEVChargingScheduleRequest, NotifyEventRequest, PublishFirmwareRequest,
+    PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
     SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
@@ -2956,6 +2956,49 @@ pub fn v201_cleared_charging_limit_request(
     ClearedChargingLimitRequest {
         charging_limit_source,
         evse_id,
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `DataTransfer.req` ([`DataTransferRequest`]) — the
+/// **CP-initiated** vendor-specific escape hatch the Charging Station originates
+/// when it needs to exchange data that no standard OCPP 2.0.1 message covers
+/// (Issue #571).
+///
+/// Ports [`ocpp.v201.call.DataTransfer`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py):
+/// a required `vendorId` scopes the exchange, an optional `messageId` names a
+/// specific message within that vendor's namespace, and an optional free-form
+/// `data` carries the payload. Unlike the ack-only notifications, the `.conf`
+/// here is non-empty (a
+/// [`DataTransferStatusEnumType`](ocpp_types::v201::DataTransferStatusEnumType)
+/// plus its own optional
+/// `data`); surfacing it is the wiring layer's job
+/// ([`ChargePoint::request_data_transfer`](crate::ChargePoint::request_data_transfer)).
+///
+/// All three inputs are threaded through **verbatim** — the builder adds no
+/// policy. `data` is `Optional[Any]` in the reference, modelled as
+/// [`serde_json::Value`] so an object, array, string, number, or bool
+/// round-trips without loss; it is caller-supplied opaque payload, copied onto
+/// the request untouched — never parsed as a path, decoded, or executed. The
+/// optional `messageId` / `data` are omitted from the wire (not `null`) when
+/// `None`; the required `vendorId` is always present. The wire-level bounds the
+/// builder does **not** re-check — `vendorId` `maxLength: 255`, `messageId`
+/// `maxLength: 50` — are enforced by the outbound schema validation in
+/// [`ChargePoint::call`](crate::ChargePoint::call), which surfaces an over-long
+/// value as an `Err`, never a panic or a silent truncation.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or
+/// a socket.
+#[must_use]
+pub fn v201_data_transfer_request(
+    vendor_id: &str,
+    message_id: Option<&str>,
+    data: Option<serde_json::Value>,
+) -> DataTransferRequest {
+    DataTransferRequest {
+        vendor_id: vendor_id.to_string(),
+        message_id: message_id.map(str::to_string),
+        data,
         custom_data: None,
     }
 }
@@ -7367,6 +7410,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- DataTransfer (v201) CP-initiated request builder (Issue #571) ---
+
+    #[test]
+    fn data_transfer_request_threads_its_fields_verbatim() {
+        // The builder is a pure pass-through: vendorId, the optional messageId,
+        // and the optional free-form data land on the request unchanged, with no
+        // vendor extension added. Present and omitted optionals both round-trip.
+        let payload = serde_json::json!({"diagnostic": "ping", "seq": 7});
+        let with =
+            v201_data_transfer_request("com.example.diag", Some("ping"), Some(payload.clone()));
+        assert_eq!(with.vendor_id, "com.example.diag");
+        assert_eq!(with.message_id.as_deref(), Some("ping"));
+        assert_eq!(with.data.as_ref(), Some(&payload));
+        assert_eq!(
+            with.custom_data, None,
+            "the builder adds no vendor extension"
+        );
+
+        let without = v201_data_transfer_request("com.example.diag", None, None);
+        assert_eq!(
+            without.message_id, None,
+            "an omitted messageId stays absent"
+        );
+        assert_eq!(without.data, None, "an omitted data stays absent");
+    }
+
+    #[test]
+    fn data_transfer_omitted_optionals_are_absent_not_null() {
+        // messageId and data are optional: when omitted they must not appear on
+        // the wire at all (not serialize to `null`), matching the schema's
+        // optional fields; the required vendorId is always present.
+        let req = v201_data_transfer_request("com.example.diag", None, None);
+        let wire = serde_json::to_value(&req).expect("serialize DataTransfer.req");
+        assert!(
+            wire.get("messageId").is_none(),
+            "the omitted messageId is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("data").is_none(),
+            "the omitted data is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("vendorId").is_some(),
+            "vendorId is always present (required)"
+        );
+    }
+
+    #[test]
+    fn data_transfer_data_round_trips_arbitrary_json_without_loss() {
+        // `data` is `Optional[Any]`: an object, array, string, and number must
+        // each be threaded onto the request and serialize back to the identical
+        // JSON, with no coercion or loss.
+        let cases = [
+            serde_json::json!({"nested": {"k": [1, 2, 3]}, "flag": true}),
+            serde_json::json!([1, "two", 3.5, null, {"a": 1}]),
+            serde_json::json!("a bare string payload"),
+            serde_json::json!(42),
+            serde_json::json!(-1.5e10),
+        ];
+        for data in cases {
+            let req = v201_data_transfer_request("v", Some("m"), Some(data.clone()));
+            let wire = serde_json::to_value(&req).expect("serialize DataTransfer.req");
+            assert_eq!(
+                wire.get("data"),
+                Some(&data),
+                "arbitrary JSON data round-trips without loss: {data}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_data_transfer_requests_are_schema_valid() {
+        // A DataTransfer.req satisfies the bundled OCPP 2.0.1 DataTransfer request
+        // JSON Schema with the optional messageId / data present and omitted, and
+        // across arbitrary data shapes (free-form `Any`).
+        let validator = SchemaValidator::v201();
+        let cases: [(Option<&str>, Option<serde_json::Value>); 5] = [
+            (None, None),
+            (Some("BootReason"), None),
+            (Some("Diagnostics"), Some(serde_json::json!({"k": "v"}))),
+            (None, Some(serde_json::json!([1, 2, 3]))),
+            (Some("Scalar"), Some(serde_json::json!("plain"))),
+        ];
+        for (message_id, data) in cases {
+            let req = v201_data_transfer_request("com.example.vendor", message_id, data.clone());
+            let payload = serde_json::to_value(&req).unwrap();
+            validator
+                .validate_call("DataTransfer", &payload)
+                .unwrap_or_else(|e| {
+                    panic!("built DataTransfer request (message_id={message_id:?}, data={data:?}) is schema-valid, got: {e}")
+                });
+            assert!(payload.get("vendorId").is_some());
+        }
+    }
+
+    #[test]
+    fn data_transfer_builder_threads_hostile_data_verbatim() {
+        // Trust boundary: caller-supplied `data` is opaque — the builder copies it
+        // onto the request untouched, never parsing it as a path, decoding it, or
+        // executing it. A payload that *looks* like a shell command or a traversal
+        // path is just data, threaded verbatim and still schema-valid (free-form).
+        let hostile = serde_json::json!({
+            "cmd": "; rm -rf / #",
+            "path": "../../../../etc/passwd",
+            "script": "<script>alert(1)</script>",
+        });
+        let req =
+            v201_data_transfer_request("com.example.vendor", Some("exec"), Some(hostile.clone()));
+        assert_eq!(
+            req.data.as_ref(),
+            Some(&hostile),
+            "hostile-looking data is threaded verbatim, never interpreted"
+        );
+        // It remains schema-valid: `data` is free-form, so content is not policed.
+        let payload = serde_json::to_value(&req).unwrap();
+        SchemaValidator::v201()
+            .validate_call("DataTransfer", &payload)
+            .expect("free-form data is not policed by the schema");
+    }
+
+    #[test]
+    fn data_transfer_oversized_vendor_id_is_rejected_by_outbound_validation() {
+        // The builder does not re-check wire bounds; the outbound schema
+        // validation `call()` runs does. An over-long vendorId (schema
+        // `maxLength: 255`) surfaces as a validation `Err`, never a panic or a
+        // silent truncation.
+        let validator = SchemaValidator::v201();
+        let oversized = "x".repeat(256);
+        let req = v201_data_transfer_request(&oversized, None, None);
+        let payload = serde_json::to_value(&req).unwrap();
+        assert!(
+            validator.validate_call("DataTransfer", &payload).is_err(),
+            "an over-long vendorId (> 255) is rejected by outbound schema validation"
+        );
+        // An over-long messageId (schema `maxLength: 50`) is likewise rejected.
+        let long_msg = "m".repeat(51);
+        let req = v201_data_transfer_request("v", Some(&long_msg), None);
+        let payload = serde_json::to_value(&req).unwrap();
+        assert!(
+            validator.validate_call("DataTransfer", &payload).is_err(),
+            "an over-long messageId (> 50) is rejected by outbound schema validation"
+        );
     }
 
     // --- SetNetworkProfile (v201) decision + response builder (Issue #528) ---
