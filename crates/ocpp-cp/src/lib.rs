@@ -227,6 +227,30 @@ pub enum UnlockConnectorOutcome {
     NotSupported,
 }
 
+/// The result of injecting a variable-monitor trip via
+/// [`ChargePoint::trip_variable_monitor`] (OCPP 2.0.1 monitoring, Issue #545).
+///
+/// A trip either matched one or more installed monitors — in which case a single
+/// `NotifyEvent` was emitted carrying one event per matched monitor — or matched
+/// none, a silent no-op. The outcome is returned (never panicked) so a caller or
+/// test can assert exactly what the injection did without inspecting the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorTripOutcome {
+    /// No installed monitor watches the injected (component, variable) identity,
+    /// so no `NotifyEvent` was emitted. The benign case a caller uses to tell a
+    /// "nothing was watching this" trip from a real emission.
+    NoMonitor,
+    /// One `NotifyEvent.req` was emitted and acknowledged, carrying `events`
+    /// `EventDataType` entries (one per matched monitor) at page sequence number
+    /// `seq_no`.
+    Emitted {
+        /// How many monitor events the emitted `NotifyEvent` carried (≥ 1).
+        events: usize,
+        /// The `seqNo` stamped on the emitted `NotifyEvent`.
+        seq_no: i32,
+    },
+}
+
 /// Default OCPP version for a Charge Point config — 1.6J, the version the
 /// simulator's runtime speaks today. Used by `#[serde(default)]` on
 /// [`ChargePointConfig::protocol_version`] so older serialized configs load.
@@ -1302,6 +1326,32 @@ pub struct ChargePoint {
     /// handlers; the CSMS queries the version and pushes `Full`/`Differential`
     /// updates. Empty at version `0` by default.
     local_list: Arc<LocalAuthList>,
+    /// The 2.0.1 device-model store, retained on the `ChargePoint` (a clone of
+    /// the same `Arc` the dispatcher's `GetVariables` / `SetVariableMonitoring`
+    /// handlers share) so CP-*initiated* seams can read it off the inbound-CALL
+    /// path. Backs [`trip_variable_monitor`](Self::trip_variable_monitor), which
+    /// looks up the installed monitors watching a variable to emit a
+    /// `NotifyEvent` (Issue #545). The store is constructed for every station
+    /// (and shared into the dispatcher) regardless of protocol version; the 2.0.1
+    /// seams that read it are gated on `config.protocol_version` at their own
+    /// entry points, so a 1.6J station simply never touches it.
+    v201_device_model: Arc<RwLock<V201DeviceModel>>,
+    /// Monotonic page-sequence counter for CP-initiated `NotifyEvent`s. Each
+    /// emitted `NotifyEvent.req` `fetch_add(1)`s to claim the next `seqNo`,
+    /// starting at `0`, so the CSMS can order the station's event stream and
+    /// detect a gap. Shared behind an `Arc<AtomicI32>` so a clone of the
+    /// `ChargePoint` (e.g. the command-consumer task) mints from the same
+    /// sequence. Modeled as a per-station monotonic stream rather than the wire's
+    /// per-report paging counter — the simulator has no multi-page report to page
+    /// within, and a monotonic value is the more useful ordering signal.
+    next_notify_event_seq_no: Arc<AtomicI32>,
+    /// Monotonic id source for the `EventDataType`s a `NotifyEvent` carries. Each
+    /// tripped monitor's event `fetch_add(1)`s to claim a unique `eventId`
+    /// (starting at `1`; `0` is avoided so an unset id is never confused with a
+    /// real one), so every reported event is individually addressable and may be
+    /// referenced as another event's `cause`. Shared behind an `Arc<AtomicI32>`
+    /// for the same reason as `next_notify_event_seq_no`.
+    next_notify_event_id: Arc<AtomicI32>,
 }
 
 impl ChargePoint {
@@ -1556,6 +1606,9 @@ impl ChargePoint {
             charging_profiles,
             data_transfer,
             local_list,
+            v201_device_model,
+            next_notify_event_seq_no: Arc::new(AtomicI32::new(0)),
+            next_notify_event_id: Arc::new(AtomicI32::new(1)),
         })
     }
 
@@ -6698,6 +6751,134 @@ impl ChargePoint {
         );
 
         Ok(())
+    }
+
+    /// Trip a CSMS-installed variable monitor, emitting a **CP-initiated** OCPP
+    /// 2.0.1 `NotifyEvent` (Part 2, monitoring, D-series; Issue #545).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.NotifyEvent`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// The variable-monitoring family until now was configure-only: a CSMS could
+    /// install monitors (`SetVariableMonitoring`), retune them
+    /// (`SetMonitoringBase` / `SetMonitoringLevel`), and read them back
+    /// (`GetMonitoringReport` → `NotifyMonitoringReport`), but **no monitor ever
+    /// fired**. This is the runtime emitter that closes that loop — the async
+    /// twin of the already-shipped `NotifyReport` / `NotifyMonitoringReport`
+    /// streams.
+    ///
+    /// # Deterministic injection
+    ///
+    /// A pure simulator has no naturally-changing variable values, so a trip must
+    /// be **injected**, matching the simulator's existing opt-in behavior-injection
+    /// seams (firmware fault injection, [`UnlockConnectorOutcome`]). This hook is
+    /// that seam: it looks up every monitor watching the (`component`, `variable`)
+    /// identity (case-insensitive, name-only — the standard-profile identities the
+    /// simulator seeds) via
+    /// [`V201DeviceModel::monitors_for_variable`](crate::v201_device_model::V201DeviceModel::monitors_for_variable)
+    /// and, for each, builds a schema-valid `EventDataType`:
+    ///
+    /// - a unique monotonic `eventId`;
+    /// - the `trigger` derived from the monitor kind
+    ///   ([`v201_command::v201_event_trigger_for_monitor`]): `Delta` → `Delta`,
+    ///   `Periodic`/`PeriodicClockAligned` → `Periodic`,
+    ///   `Upper`/`LowerThreshold` → `Alerting`;
+    ///   `eventNotificationType` = `CustomMonitor` (the monitor was CSMS-installed);
+    /// - the `variableMonitoringId` correlating the event back to the monitor;
+    /// - the reported `actual_value`.
+    ///
+    /// All matched monitors ride one `NotifyEvent` page, stamped with the next
+    /// monotonic `seqNo` (see the `next_notify_event_seq_no` field).
+    ///
+    /// # Outcome
+    ///
+    /// - **No monitor matches** → [`MonitorTripOutcome::NoMonitor`], no CALL is
+    ///   emitted (a benign no-op — the value changed but nothing was watching it).
+    /// - **≥ 1 monitor matches** → one `NotifyEvent.req` is emitted and, on the
+    ///   CSMS's empty ack, [`MonitorTripOutcome::Emitted`] reports how many events
+    ///   it carried and the `seqNo` used.
+    ///
+    /// The `seqNo` is claimed **only** when at least one monitor matches, so a
+    /// no-op trip does not burn a sequence position and leave a phantom gap in the
+    /// CSMS's view of the stream.
+    ///
+    /// # Trust boundary
+    ///
+    /// `actual_value` is **opaque, caller-supplied** text — the reported value at
+    /// the moment of the trip. It is threaded to the wire verbatim: never parsed
+    /// as a number, decoded, or executed. A hostile or oversized value cannot
+    /// panic the station — the schema's `maxLength: 2500` is enforced by
+    /// [`call`](Self::call)'s outbound validation, which surfaces an over-long
+    /// value as an [`OcppError`], never a panic or a silent truncation. The
+    /// observability log records the identity and match count, never the value.
+    ///
+    /// # Version
+    ///
+    /// V201-only: `NotifyEvent` and the device-model monitoring subsystem are
+    /// 2.0.1 constructs, so a call on a `V16J` station is refused with
+    /// [`OcppError::NotSupported`]. Transport/timeout/CALLERROR failures propagate
+    /// as [`OcppError`].
+    pub async fn trip_variable_monitor(
+        &self,
+        component: &str,
+        variable: &str,
+        actual_value: &str,
+    ) -> OcppResult<MonitorTripOutcome> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "NotifyEvent (variable-monitor trip) is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        // Snapshot the matching monitors off the store, then drop the read lock
+        // before emitting the outbound CALL (the send must not hold the lock).
+        let matched = {
+            let model = self.v201_device_model.read().await;
+            model.monitors_for_variable(component, variable)
+        };
+        if matched.is_empty() {
+            info!(
+                component = %component,
+                variable = %variable,
+                "variable-monitor trip matched no installed monitor; no NotifyEvent emitted"
+            );
+            return Ok(MonitorTripOutcome::NoMonitor);
+        }
+
+        let generated_at = v201_now();
+        let event_data: Vec<_> = matched
+            .iter()
+            .map(|m| {
+                v201_command::v201_monitor_event_data(
+                    self.next_notify_event_id.fetch_add(1, Ordering::SeqCst),
+                    &generated_at,
+                    m.kind,
+                    actual_value,
+                    m.component.clone(),
+                    m.variable.clone(),
+                    m.id,
+                )
+            })
+            .collect();
+        let events = event_data.len();
+        let seq_no = self.next_notify_event_seq_no.fetch_add(1, Ordering::SeqCst);
+
+        let request = v201_command::v201_notify_event_request(&generated_at, seq_no, event_data);
+        // The `.conf` is empty (ack only); `call()` still schema-validates both
+        // the outbound request and the ack. Discard it on success.
+        let _ack = self.call(request).await?;
+
+        info!(
+            component = %component,
+            variable = %variable,
+            events,
+            seq_no,
+            // Presence/count only — `actual_value` is opaque and never logged.
+            "originated NotifyEvent for a variable-monitor trip; CSMS acknowledged"
+        );
+
+        Ok(MonitorTripOutcome::Emitted { events, seq_no })
     }
 
     /// Originate a 2.0.1 `NotifyChargingLimit.req` — the station's **unsolicited**
@@ -12676,6 +12857,200 @@ mod tests {
         ));
     }
 
+    // --- trip_variable_monitor() → NotifyEvent (Issue #545) ---
+
+    /// Install one CSMS monitor on `OCPPCommCtrlr` / `HeartbeatInterval` (a
+    /// standard-profile variable) via the inbound `SetVariableMonitoring` handler,
+    /// which writes to the same device-model store the trip hook reads. Returns
+    /// the station-assigned monitor id.
+    async fn install_one_monitor(cp: &ChargePoint, kind: ocpp_types::v201::MonitorEnumType) -> i32 {
+        use ocpp_types::v201::SetMonitoringStatusEnumType;
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+                v201_monitor_data("OCPPCommCtrlr", "HeartbeatInterval", kind, 1.0, 3),
+            ])))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.set_monitoring_result[0].status,
+                    SetMonitoringStatusEnumType::Accepted
+                );
+                body.set_monitoring_result[0].id.expect("accepted → id")
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    /// Drain the capturing channel until the first `NotifyEvent` CALL, returning
+    /// its payload. Bounded by a timeout so a missing emission fails fast.
+    async fn recv_notify_event(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> serde_json::Value {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "NotifyEvent" => return payload,
+                Ok(Some(_)) => continue, // BootNotification / StatusNotification, etc.
+                Ok(None) | Err(_) => panic!("no NotifyEvent CALL was emitted"),
+            }
+        }
+    }
+
+    fn notify_event_routes() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // NotifyEvent.conf is an empty ack.
+        routes.insert("NotifyEvent".to_string(), serde_json::json!({}));
+        routes
+    }
+
+    #[tokio::test]
+    async fn trip_variable_monitor_emits_one_correlated_notify_event() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        let id = install_one_monitor(&cp, ocpp_types::v201::MonitorEnumType::Delta).await;
+
+        let outcome = cp
+            .trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "900")
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            MonitorTripOutcome::Emitted {
+                events: 1,
+                seq_no: 0
+            }
+        );
+
+        let payload = recv_notify_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 0);
+        assert!(payload.get("tbc").is_none());
+        let events = payload["eventData"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "one monitor → one event");
+        let e = &events[0];
+        assert_eq!(e["trigger"], "Delta");
+        assert_eq!(e["eventNotificationType"], "CustomMonitor");
+        assert_eq!(e["actualValue"], "900");
+        assert_eq!(e["variableMonitoringId"], id);
+        assert_eq!(e["component"]["name"], "OCPPCommCtrlr");
+        assert_eq!(e["variable"]["name"], "HeartbeatInterval");
+    }
+
+    #[tokio::test]
+    async fn trip_variable_monitor_with_no_matching_monitor_is_noop() {
+        // No monitor installed at all, and a monitor on a *different* variable —
+        // neither matches, so the trip is a silent no-op with no CALL emitted (and
+        // no socket is needed, since nothing is sent).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert_eq!(
+            cp.trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "900")
+                .await
+                .unwrap(),
+            MonitorTripOutcome::NoMonitor
+        );
+        // Install on HeartbeatInterval, then trip a different (unmonitored) variable.
+        install_one_monitor(&cp, ocpp_types::v201::MonitorEnumType::Delta).await;
+        assert_eq!(
+            cp.trip_variable_monitor("OCPPCommCtrlr", "NoSuchVariable", "1")
+                .await
+                .unwrap(),
+            MonitorTripOutcome::NoMonitor
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_variable_monitor_seq_no_and_event_id_increment_across_events() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        install_one_monitor(&cp, ocpp_types::v201::MonitorEnumType::Periodic).await;
+
+        let first = cp
+            .trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "1")
+            .await
+            .unwrap();
+        let second = cp
+            .trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "2")
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            MonitorTripOutcome::Emitted {
+                events: 1,
+                seq_no: 0
+            }
+        );
+        assert_eq!(
+            second,
+            MonitorTripOutcome::Emitted {
+                events: 1,
+                seq_no: 1
+            }
+        );
+
+        // The wire confirms both the seqNo and the monotonic eventId advance.
+        let first_payload = recv_notify_event(&mut rx).await;
+        let second_payload = recv_notify_event(&mut rx).await;
+        assert_eq!(first_payload["seqNo"], 0);
+        assert_eq!(second_payload["seqNo"], 1);
+        let first_id = first_payload["eventData"][0]["eventId"].as_i64().unwrap();
+        let second_id = second_payload["eventData"][0]["eventId"].as_i64().unwrap();
+        assert!(
+            second_id > first_id,
+            "eventId must advance across events ({first_id} → {second_id})"
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_variable_monitor_with_oversized_actual_value_errors_without_panic() {
+        // Trust boundary: a hostile, oversized `actualValue` (the schema caps it
+        // at 2500) is rejected by `call()`'s outbound validation as an `Err` —
+        // never a panic. Reaching the assertion at all proves no panic occurred.
+        let (addr, _rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        install_one_monitor(&cp, ocpp_types::v201::MonitorEnumType::UpperThreshold).await;
+
+        let oversized = "x".repeat(3000);
+        let result = cp
+            .trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", &oversized)
+            .await;
+        assert!(
+            result.is_err(),
+            "an over-2500-char actualValue must surface as an Err, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_variable_monitor_is_v201_only() {
+        // A 1.6J station has no NotifyEvent / device-model monitoring path.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "900")
+                .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn request_notify_ev_charging_schedule_surfaces_accepted_status() {
         let mut routes = std::collections::HashMap::new();
@@ -12841,141 +13216,6 @@ mod tests {
             cp.request_security_event_notification(
                 "StartupOfTheDevice",
                 "2026-09-05T12:00:00Z",
-                None
-            )
-            .await,
-            Err(OcppError::NotSupported { .. })
-        ));
-    }
-
-    // --- OCPP 2.0.1 NotifyChargingLimit / ClearedChargingLimit (M7, #564) --
-    // The station reports an external charging limit being imposed
-    // (`NotifyChargingLimit`) and later lifted (`ClearedChargingLimit`); the CSMS
-    // replies with an empty ack to each. These exercise the driver hooks against
-    // a mock CSMS returning `{}`.
-
-    fn notify_limit_sample() -> ocpp_types::v201::ChargingLimitType {
-        ocpp_types::v201::ChargingLimitType {
-            charging_limit_source: ocpp_types::v201::ChargingLimitSourceEnumType::So,
-            is_grid_critical: Some(true),
-            custom_data: None,
-        }
-    }
-
-    fn notify_limit_schedule() -> ocpp_types::v201::ChargingScheduleType {
-        use ocpp_types::v201::{ChargingRateUnitEnumType, ChargingSchedulePeriodType};
-        ocpp_types::v201::ChargingScheduleType {
-            id: 1,
-            charging_rate_unit: ChargingRateUnitEnumType::A,
-            charging_schedule_period: vec![ChargingSchedulePeriodType {
-                start_period: 0,
-                limit: 16.0,
-                number_phases: None,
-                phase_to_use: None,
-                custom_data: None,
-            }],
-            start_schedule: None,
-            duration: None,
-            min_charging_rate: None,
-            sales_tariff: None,
-            custom_data: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn request_notify_charging_limit_reports_and_returns_ok() {
-        // A station-wide imposed limit (no evseId, no schedule): the empty `.conf`
-        // is parsed and surfaced as `Ok(())` without panic.
-        let mut routes = std::collections::HashMap::new();
-        routes.insert(
-            "BootNotification".to_string(),
-            boot_response("Accepted", 3600),
-        );
-        routes.insert("NotifyChargingLimit".to_string(), serde_json::json!({}));
-        let addr = spawn_mock_csms_routing(routes).await;
-        let cp = ChargePoint::new(ChargePointConfig {
-            central_system_url: format!("ws://{addr}"),
-            ..ChargePointConfig::for_version(OcppVersion::V201)
-        })
-        .unwrap();
-        cp.connect().await.unwrap();
-
-        cp.request_notify_charging_limit(notify_limit_sample(), None, None)
-            .await
-            .expect("the empty NotifyChargingLimit ack surfaces as Ok(())");
-    }
-
-    #[tokio::test]
-    async fn request_notify_charging_limit_with_evse_and_schedule_reports() {
-        // The full form — a per-EVSE limit carrying a resulting schedule — is
-        // equally accepted and surfaces as `Ok(())`.
-        let mut routes = std::collections::HashMap::new();
-        routes.insert(
-            "BootNotification".to_string(),
-            boot_response("Accepted", 3600),
-        );
-        routes.insert("NotifyChargingLimit".to_string(), serde_json::json!({}));
-        let addr = spawn_mock_csms_routing(routes).await;
-        let cp = ChargePoint::new(ChargePointConfig {
-            central_system_url: format!("ws://{addr}"),
-            ..ChargePointConfig::for_version(OcppVersion::V201)
-        })
-        .unwrap();
-        cp.connect().await.unwrap();
-
-        cp.request_notify_charging_limit(
-            notify_limit_sample(),
-            Some(2),
-            Some(vec![notify_limit_schedule()]),
-        )
-        .await
-        .expect("a per-EVSE NotifyChargingLimit with a schedule reports successfully");
-    }
-
-    #[tokio::test]
-    async fn request_notify_charging_limit_is_v201_only() {
-        // NotifyChargingLimit is a 2.0.1 message: a 1.6J station is refused rather
-        // than putting a 2.0.1 message on a 1.6J link.
-        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        assert!(matches!(
-            cp.request_notify_charging_limit(notify_limit_sample(), None, None)
-                .await,
-            Err(OcppError::NotSupported { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn request_cleared_charging_limit_reports_and_returns_ok() {
-        // The paired clear: an external limit is lifted station-wide; the empty
-        // `.conf` surfaces as `Ok(())`.
-        let mut routes = std::collections::HashMap::new();
-        routes.insert(
-            "BootNotification".to_string(),
-            boot_response("Accepted", 3600),
-        );
-        routes.insert("ClearedChargingLimit".to_string(), serde_json::json!({}));
-        let addr = spawn_mock_csms_routing(routes).await;
-        let cp = ChargePoint::new(ChargePointConfig {
-            central_system_url: format!("ws://{addr}"),
-            ..ChargePointConfig::for_version(OcppVersion::V201)
-        })
-        .unwrap();
-        cp.connect().await.unwrap();
-
-        cp.request_cleared_charging_limit(
-            ocpp_types::v201::ChargingLimitSourceEnumType::So,
-            Some(2),
-        )
-        .await
-        .expect("the empty ClearedChargingLimit ack surfaces as Ok(())");
-    }
-
-    #[tokio::test]
-    async fn request_cleared_charging_limit_is_v201_only() {
-        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        assert!(matches!(
-            cp.request_cleared_charging_limit(
-                ocpp_types::v201::ChargingLimitSourceEnumType::Ems,
                 None
             )
             .await,
@@ -15626,6 +15866,54 @@ mod tests {
         });
 
         addr
+    }
+
+    /// Like [`spawn_mock_csms_routing`] but also **records** every inbound CALL
+    /// (action + payload) onto the returned channel, so a test can assert what
+    /// the CP actually put on the wire (e.g. the `NotifyEvent` a monitor trip
+    /// emits). Responses are still routed by `routes`.
+    async fn spawn_mock_csms_capturing(
+        routes: std::collections::HashMap<String, serde_json::Value>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(frame)) = ws.next().await {
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
+                        if let Ok(Message::Call(call)) = serde_json::from_str::<Message>(&text) {
+                            // Record the inbound CALL before answering it.
+                            let _ = tx.send((call.action.clone(), call.payload.clone()));
+                            let payload = routes.get(&call.action).cloned().or_else(|| {
+                                (call.action == "StatusNotification").then(|| serde_json::json!({}))
+                            });
+                            if let Some(payload) = payload {
+                                let result = Message::CallResult(CallResultMessage {
+                                    message_type: MessageType::CallResult,
+                                    unique_id: call.unique_id,
+                                    payload,
+                                });
+                                let json = serde_json::to_string(&result).unwrap();
+                                let _ = ws
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(json))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        (addr, rx)
     }
 
     // --- id_tag_info_expired() helper (Issue #104) ---
