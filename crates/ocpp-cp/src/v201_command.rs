@@ -1942,7 +1942,7 @@ fn v201_report_pages<T, R>(
 /// [`tbc`](NotifyReportRequest::tbc) ("to be continued"), the final page leaving it
 /// absent (= `false`) — the same paging contract as
 /// [`v201_notify_customer_information_pages`]. An empty report still builds exactly
-/// one final page with no `reportData` (see [`v201_report_pages`]).
+/// one final page with no `reportData` (see the shared `v201_report_pages` core).
 #[must_use]
 pub fn v201_notify_report_pages(
     request_id: i32,
@@ -1968,7 +1968,7 @@ pub fn v201_notify_report_pages(
 /// [`V201_REPORT_ENTRIES_PER_PAGE`] [`MonitoringDataType`] entries, same
 /// `request_id` correlation, single shared `generated_at`, monotonic `seqNo` from
 /// 0, and `tbc` on every page but the last. An empty snapshot still builds exactly
-/// one final page with no `monitor` array (see [`v201_report_pages`]).
+/// one final page with no `monitor` array (see the shared `v201_report_pages` core).
 #[must_use]
 pub fn v201_notify_monitoring_report_pages(
     request_id: i32,
