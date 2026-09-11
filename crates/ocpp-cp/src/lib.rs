@@ -129,8 +129,6 @@ use ocpp_messages::v201::{
     GetVariablesResponse as V201GetVariablesResponse,
     InstallCertificateRequest as V201InstallCertificateRequest,
     MeterValuesRequest as V201MeterValuesRequest,
-    NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
-    NotifyReportRequest as V201NotifyReportRequest,
     PublishFirmwareRequest as V201PublishFirmwareRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
@@ -8188,21 +8186,29 @@ impl ChargePoint {
     /// the report back to the triggering `GetBaseReport`; `report_data` is the
     /// snapshot the handler already computed.
     ///
-    /// A single page carries the whole report (`seqNo` 0, `tbc` omitted =
-    /// `false`) — correct for the simulator's small seeded device model.
-    /// Multi-page chunking (`tbc` paging) is a later slice once the inventory
-    /// grows beyond one frame.
+    /// The report is *paged*: the pure
+    /// [`v201_notify_report_pages`](crate::v201_command::v201_notify_report_pages)
+    /// builder splits the snapshot into pages of at most
+    /// [`V201_REPORT_ENTRIES_PER_PAGE`](crate::v201_command::V201_REPORT_ENTRIES_PER_PAGE)
+    /// entries, numbered with a monotonic `seqNo` from 0 and flagged `tbc` ("to be
+    /// continued") on every page but the last, all correlated by `requestId` and
+    /// sharing one `generatedAt`. Each page is sent in order so the CSMS sees the
+    /// paging flags in sequence — a small seeded inventory still fits one page
+    /// (`seqNo` 0, `tbc` omitted), while a large `FullInventory` reports faithfully
+    /// instead of overflowing a single frame.
     async fn send_v201_notify_report(&self, request_id: i32, report_data: Vec<ReportDataType>) {
-        let request = V201NotifyReportRequest {
-            request_id,
-            generated_at: v201_now(),
-            report_data: Some(report_data),
-            tbc: None,
-            seq_no: 0,
-            custom_data: None,
-        };
-        if let Err(e) = self.call(request).await {
-            warn!("v201 GetBaseReport: NotifyReport send failed for request {request_id}: {e}");
+        // One shared `generatedAt` for the whole report — every page echoes the
+        // instant the snapshot was taken, not the moment each page is flushed.
+        let generated_at = v201_now();
+        let pages = v201_command::v201_notify_report_pages(request_id, &generated_at, report_data);
+        for page in pages {
+            let seq_no = page.seq_no;
+            if let Err(e) = self.call(page).await {
+                warn!(
+                    "v201 GetBaseReport: NotifyReport page {seq_no} send failed for \
+                     request {request_id}: {e}"
+                );
+            }
         }
     }
 
@@ -8218,27 +8224,34 @@ impl ChargePoint {
     /// `GetMonitoringReport`; `monitor_data` is the snapshot the handler already
     /// computed.
     ///
-    /// A single page carries the whole snapshot (`seqNo` 0, `tbc` omitted =
-    /// `false`) — correct for the simulator's small monitor set. Multi-page
-    /// chunking (`tbc` paging) is a later slice once the monitor set grows beyond
-    /// one frame.
+    /// The snapshot is *paged*, exactly as
+    /// [`send_v201_notify_report`](Self::send_v201_notify_report): the pure
+    /// [`v201_notify_monitoring_report_pages`](crate::v201_command::v201_notify_monitoring_report_pages)
+    /// builder splits it into pages of at most
+    /// [`V201_REPORT_ENTRIES_PER_PAGE`](crate::v201_command::V201_REPORT_ENTRIES_PER_PAGE)
+    /// entries, monotonic `seqNo` from 0, `tbc` on every page but the last,
+    /// correlated by `requestId` and sharing one `generatedAt`; a small monitor
+    /// set still fits one page while a large one reports faithfully.
     async fn send_v201_notify_monitoring_report(
         &self,
         request_id: i32,
         monitor_data: Vec<MonitoringDataType>,
     ) {
-        let request = V201NotifyMonitoringReportRequest {
-            monitor: Some(monitor_data),
+        // One shared `generatedAt` for the whole snapshot (see send_v201_notify_report).
+        let generated_at = v201_now();
+        let pages = v201_command::v201_notify_monitoring_report_pages(
             request_id,
-            tbc: None,
-            seq_no: 0,
-            generated_at: v201_now(),
-            custom_data: None,
-        };
-        if let Err(e) = self.call(request).await {
-            warn!(
-                "v201 GetMonitoringReport: NotifyMonitoringReport send failed for request {request_id}: {e}"
-            );
+            &generated_at,
+            monitor_data,
+        );
+        for page in pages {
+            let seq_no = page.seq_no;
+            if let Err(e) = self.call(page).await {
+                warn!(
+                    "v201 GetMonitoringReport: NotifyMonitoringReport page {seq_no} send \
+                     failed for request {request_id}: {e}"
+                );
+            }
         }
     }
 
@@ -9232,6 +9245,12 @@ mod tests {
     use ocpp_types::v16j::{ConfigurationStatus, RemoteStartStopStatus, ResetType};
     use ocpp_types::v201::UnpublishFirmwareStatusEnumType;
     use ocpp_types::CallResultMessage;
+    // Report request types used only by the tbc-paging tests (#574); the library
+    // emitters build these via the `v201_command` pagers, not these aliases.
+    use ocpp_messages::v201::{
+        NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
+        NotifyReportRequest as V201NotifyReportRequest,
+    };
 
     // Helper: build a CallMessage from an action struct
     fn make_call<T: OcppAction>(req: T) -> CallMessage {
@@ -13049,6 +13068,106 @@ mod tests {
                 .await,
             Err(OcppError::NotSupported { .. })
         ));
+    }
+
+    // ---- NotifyReport tbc paging over the wire (#574) ----
+
+    fn notify_report_routes() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // NotifyReport.conf is an empty ack.
+        routes.insert("NotifyReport".to_string(), serde_json::json!({}));
+        routes
+    }
+
+    /// Drain the capturing channel for `target` `NotifyReport` CALLs, deserializing
+    /// each into the typed request. Bounded by a per-page timeout so a missing page
+    /// fails fast rather than hanging.
+    async fn recv_notify_reports(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+        target: usize,
+    ) -> Vec<V201NotifyReportRequest> {
+        let mut out = Vec::new();
+        while out.len() < target {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "NotifyReport" => {
+                    out.push(
+                        serde_json::from_value(payload).expect("captured NotifyReport is typed"),
+                    );
+                }
+                Ok(Some(_)) => continue, // BootNotification / StatusNotification, etc.
+                Ok(None) | Err(_) => {
+                    panic!("expected {target} NotifyReport CALL(s), saw {}", out.len())
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn send_v201_notify_report_streams_ordered_tbc_pages_over_the_wire() {
+        // Grow the seeded device model past one page, then stream a real
+        // FullInventory report: the emitter must chunk it into ordered `tbc` pages,
+        // correlated by requestId, with a monotonic seqNo — observed on the wire.
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_report_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        {
+            let mut model = cp.v201_device_model.write().await;
+            for n in 0..(v201_command::V201_REPORT_ENTRIES_PER_PAGE + 5) {
+                model.set_station_variable(
+                    "PagingTestCtrlr",
+                    &format!("Var{n}"),
+                    AttributeEnumType::Actual,
+                    n.to_string(),
+                );
+            }
+        }
+        cp.connect().await.unwrap();
+
+        let data = cp
+            .v201_device_model
+            .read()
+            .await
+            .report(ocpp_types::v201::ReportBaseEnumType::FullInventory);
+        let expected_pages = data
+            .len()
+            .div_ceil(v201_command::V201_REPORT_ENTRIES_PER_PAGE);
+        assert!(
+            expected_pages >= 2,
+            "the grown model ({} entries) must exceed one page",
+            data.len()
+        );
+        cp.send_v201_notify_report(77, data).await;
+
+        let pages = recv_notify_reports(&mut rx, expected_pages).await;
+        assert_eq!(pages.len(), expected_pages, "one CALL per page");
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(
+                page.seq_no,
+                i32::try_from(i).unwrap(),
+                "seqNo is the monotonic page index"
+            );
+            assert_eq!(
+                page.request_id, 77,
+                "every page echoes the GetBaseReport id"
+            );
+            assert!(
+                page.report_data.as_ref().is_some_and(|d| !d.is_empty()),
+                "each page carries reportData"
+            );
+            if i + 1 < expected_pages {
+                assert_eq!(page.tbc, Some(true), "non-final page is 'to be continued'");
+            } else {
+                assert!(page.tbc.is_none(), "the final page is not continued");
+            }
+        }
     }
 
     #[tokio::test]
