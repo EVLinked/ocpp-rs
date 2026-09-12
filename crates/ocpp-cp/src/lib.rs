@@ -7119,13 +7119,12 @@ impl ChargePoint {
     /// - **A real transition** → one `TransactionEvent(Updated,
     ///   ChargingStateChanged)` is emitted and, on the CSMS's ack,
     ///   [`ChargingStateChangeOutcome::Emitted`] reports the `seqNo` used. The
-    ///   `seqNo` is drawn from the transaction's shared monotonic counter
-    ///   ([`V201Session::next_seq_no`]), so it interleaves cleanly with the
-    ///   periodic sampler's `Updated` events and stays strictly between `Started`
-    ///   and `Ended`.
+    ///   `seqNo` is drawn from the transaction's shared monotonic `next_seq_no`
+    ///   counter, so it interleaves cleanly with the periodic sampler's
+    ///   `Updated` events and stays strictly between `Started` and `Ended`.
     ///
-    /// The compare-and-emit runs under the session's own
-    /// [`charging_state`](V201Session::charging_state) [`Mutex`], not the
+    /// The compare-and-emit runs under the session's own `charging_state`
+    /// [`Mutex`], not the
     /// `v201_sessions` map lock, so a redundant transition is a true no-op and
     /// two concurrent transitions can't both emit; holding it across the send
     /// serializes only this connector's state changes (inherently sequential),
