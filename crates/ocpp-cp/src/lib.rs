@@ -84,7 +84,7 @@ use v201_certificate_store::V201CertificateStore;
 use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_customer_information::V201CustomerInformationStore;
-use v201_device_model::V201DeviceModel;
+use v201_device_model::{TrippedMonitor, V201DeviceModel};
 use v201_display_message::V201DisplayMessageStore;
 use v201_firmware_update::V201FirmwareUpdateStore;
 use v201_log_upload::V201LogUploadStore;
@@ -165,9 +165,9 @@ use ocpp_types::v201::{
     NotifyEVChargingNeedsStatusEnumType, OCSPRequestDataType, OperationalStatusEnumType,
     PublishFirmwareStatusEnumType, RegistrationStatusEnumType, ReportDataType,
     RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
-    ResetStatusEnumType, SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType,
+    ResetStatusEnumType, SetNetworkProfileStatusEnumType, SetVariableResultType,
+    SetVariableStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -698,6 +698,28 @@ enum RemoteCommand {
     V201NotifyMonitoringReport {
         request_id: i32,
         monitor_data: Vec<MonitoringDataType>,
+    },
+    /// Auto-originate a 2.0.1 `NotifyEvent` for the variable monitor(s) an inbound
+    /// `SetVariables` write tripped by crossing their threshold / delta (Part 2,
+    /// monitoring; Issue #573). The autonomous, inbound-CALL-triggered twin of the
+    /// [`trip_variable_monitor`](ChargePoint::trip_variable_monitor) injection
+    /// seam: because the trip is raised from *inside* the `SetVariables` handler,
+    /// it must be drained here off the command-consumer task — so the
+    /// `SetVariablesResponse` CALLRESULT is flushed before the outbound
+    /// `NotifyEvent` CALL, with no receive-loop re-entrancy (the same discipline as
+    /// [`V201NotifyReport`](Self::V201NotifyReport) /
+    /// [`V201NotifyMonitoringReport`](Self::V201NotifyMonitoringReport)), unlike the
+    /// CP-initiated seam which emits inline. `monitors` is the already-selected
+    /// crossed subset (computed under the device-model write lock on the CALL path
+    /// via [`V201DeviceModel::monitors_tripped_by_write`](crate::v201_device_model::V201DeviceModel::monitors_tripped_by_write),
+    /// so the send touches no shared state) and `actual_value` the new value
+    /// threaded verbatim onto each event. Emitted through the shared
+    /// [`emit_monitor_notify_event`](ChargePoint::emit_monitor_notify_event) core,
+    /// so trigger derivation, `CustomMonitor` tagging, correlation, and the
+    /// monotonic `seqNo` / `eventId` streams are not duplicated.
+    V201MonitorTrip {
+        monitors: Vec<TrippedMonitor>,
+        actual_value: String,
     },
     /// Stream the installed charging profiles a CSMS asked for with an `Accepted`
     /// OCPP 2.0.1 `GetChargingProfiles` (Part 2). The synchronous
@@ -1916,40 +1938,121 @@ impl ChargePoint {
         // input. The write is applied on the CALL path (a device-model store
         // update is cheap and must be visible to the CALLRESULT and to any
         // subsequent `GetVariables`), serialized by the model's write lock.
+        //
+        // Autonomous monitor trip (Issue #573): an accepted write that actually
+        // changes a monitored variable's `Actual` value and crosses an installed
+        // threshold / delta monitor auto-originates a `NotifyEvent`. The crossed
+        // monitors are selected under the same write lock (so the read is
+        // consistent with the write), but the `NotifyEvent` is emitted off the
+        // command-consumer task via `RemoteCommand::V201MonitorTrip` — never
+        // inline — so this `SetVariablesResponse` is flushed first (no
+        // receive-loop re-entrancy). Rejected / unknown / non-`Actual` /
+        // value-unchanged writes trip nothing.
         // Ports `ocpp.v201.call.SetVariables`.
         if matches!(protocol_version, OcppVersion::V201) {
             let device_model = v201_device_model.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: V201SetVariablesRequest| {
                 let device_model = device_model.clone();
+                let command_sender = command_sender.clone();
                 async move {
-                    let mut model = device_model.write().await;
+                    // Monitor trips to enqueue once the write lock is dropped and
+                    // the CALLRESULT is on its way: the crossed monitors and the
+                    // new value each `NotifyEvent` reports verbatim.
+                    let mut trips: Vec<(Vec<TrippedMonitor>, String)> = Vec::new();
+
                     // One result per requested entry, in request order. Each
                     // result echoes the CSMS's original (un-normalized)
                     // `component` / `variable` / `attributeType`; an omitted
                     // `attributeType` resolves to `Actual` for the write but is
                     // echoed back as `None`, mirroring the read seam.
-                    let set_variable_result: Vec<SetVariableResultType> = req
-                        .set_variable_data
-                        .iter()
-                        .map(|data| {
-                            let attribute =
-                                data.attribute_type.unwrap_or(AttributeEnumType::Actual);
-                            let attribute_status = model.set(
-                                &data.component,
-                                &data.variable,
-                                attribute,
-                                &data.attribute_value,
+                    let set_variable_result: Vec<SetVariableResultType> = {
+                        let mut model = device_model.write().await;
+                        req.set_variable_data
+                            .iter()
+                            .map(|data| {
+                                let attribute =
+                                    data.attribute_type.unwrap_or(AttributeEnumType::Actual);
+                                // Snapshot the prior `Actual` value *before* the
+                                // write so a threshold / delta crossing can be
+                                // detected; only the `Actual` attribute drives
+                                // monitors, so other attributes need no snapshot.
+                                let previous = if attribute == AttributeEnumType::Actual {
+                                    model
+                                        .get(
+                                            &data.component,
+                                            &data.variable,
+                                            AttributeEnumType::Actual,
+                                        )
+                                        .1
+                                } else {
+                                    None
+                                };
+                                let attribute_status = model.set(
+                                    &data.component,
+                                    &data.variable,
+                                    attribute,
+                                    &data.attribute_value,
+                                );
+                                // A write that took effect on `Actual` and
+                                // actually changed the value may cross a monitor.
+                                // `Rejected` / `Unknown*` / `NotSupported` writes
+                                // never mutate, and a no-op rewrite crosses
+                                // nothing, so neither trips.
+                                let took_effect = matches!(
+                                    attribute_status,
+                                    SetVariableStatusEnumType::Accepted
+                                        | SetVariableStatusEnumType::RebootRequired
+                                );
+                                if took_effect && attribute == AttributeEnumType::Actual {
+                                    if let Some(prev) = previous.as_deref() {
+                                        if prev != data.attribute_value {
+                                            let crossed = model.monitors_tripped_by_write(
+                                                &data.component.name,
+                                                &data.variable.name,
+                                                prev,
+                                                &data.attribute_value,
+                                            );
+                                            if !crossed.is_empty() {
+                                                trips.push((crossed, data.attribute_value.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                SetVariableResultType {
+                                    attribute_status,
+                                    component: data.component.clone(),
+                                    variable: data.variable.clone(),
+                                    attribute_type: data.attribute_type,
+                                    attribute_status_info: None,
+                                    custom_data: None,
+                                }
+                            })
+                            .collect()
+                        // Write lock dropped here, before the trips are enqueued.
+                    };
+
+                    // Drain the collected trips onto the command-consumer task so
+                    // each `NotifyEvent` is emitted *after* this
+                    // `SetVariablesResponse`, never inline. A gone consumer (CP
+                    // shutting down) drops the trip best-effort; the write is
+                    // already applied and the CALLRESULT is honest.
+                    for (monitors, actual_value) in trips {
+                        if command_sender
+                            .send(RemoteCommand::V201MonitorTrip {
+                                monitors,
+                                actual_value,
+                            })
+                            .is_err()
+                        {
+                            warn!(
+                                "v201 SetVariables: consumer gone, cannot emit NotifyEvent for a \
+                                 tripped variable monitor"
                             );
-                            SetVariableResultType {
-                                attribute_status,
-                                component: data.component.clone(),
-                                variable: data.variable.clone(),
-                                attribute_type: data.attribute_type,
-                                attribute_status_info: None,
-                                custom_data: None,
-                            }
-                        })
-                        .collect();
+                            break;
+                        }
+                    }
+
                     Ok(V201SetVariablesResponse {
                         set_variable_result,
                         custom_data: None,
@@ -5406,6 +5509,24 @@ impl ChargePoint {
                             cp.send_v201_notify_monitoring_report(request_id, monitor_data)
                                 .await;
                         }
+                        RemoteCommand::V201MonitorTrip {
+                            monitors,
+                            actual_value,
+                        } => {
+                            // Emit the auto-trip `NotifyEvent` off the CALL path
+                            // (Issue #573). Best-effort: the triggering
+                            // `SetVariablesResponse` was already returned, so a
+                            // transport / CALLERROR failure here is logged, not
+                            // surfaced.
+                            if let Err(e) =
+                                cp.emit_monitor_notify_event(&monitors, &actual_value).await
+                            {
+                                warn!(
+                                    "v201 auto-trip: failed to emit NotifyEvent for a \
+                                     SetVariables threshold crossing: {e}"
+                                );
+                            }
+                        }
                         RemoteCommand::V201ReportChargingProfiles {
                             request_id,
                             profiles,
@@ -6846,8 +6967,54 @@ impl ChargePoint {
             return Ok(MonitorTripOutcome::NoMonitor);
         }
 
+        let outcome = self
+            .emit_monitor_notify_event(&matched, actual_value)
+            .await?;
+
+        info!(
+            component = %component,
+            variable = %variable,
+            // Presence/count only — `actual_value` is opaque and never logged.
+            outcome = ?outcome,
+            "originated NotifyEvent for a variable-monitor trip; CSMS acknowledged"
+        );
+
+        Ok(outcome)
+    }
+
+    /// Build and emit a single OCPP 2.0.1 `NotifyEvent` CALL carrying one
+    /// [`EventDataType`](ocpp_types::v201::EventDataType) per monitor in
+    /// `monitors`, stamped with the next monotonic `seqNo` and a per-event
+    /// monotonic `eventId`, all reporting the opaque `actual_value` verbatim.
+    ///
+    /// The shared emitter core behind both variable-monitor trip paths — the
+    /// CP-initiated injection seam
+    /// [`trip_variable_monitor`](Self::trip_variable_monitor) and the autonomous
+    /// `SetVariables`-crossing path drained via
+    /// [`RemoteCommand::V201MonitorTrip`] — so trigger derivation
+    /// ([`v201_command::v201_event_trigger_for_monitor`]), `CustomMonitor`
+    /// tagging, `variableMonitoringId` correlation, and the monotonic `seqNo` /
+    /// `eventId` streams live in exactly one place (Issue #573; no duplicated trip
+    /// logic).
+    ///
+    /// An empty `monitors` slice emits nothing and claims **no** `seqNo`
+    /// (returns [`MonitorTripOutcome::NoMonitor`]), so a caller that finds no
+    /// match never burns a sequence position and leaves no phantom gap in the
+    /// CSMS's view of the stream. The `actual_value` is opaque, caller-supplied
+    /// text threaded to the wire verbatim; an over-long value surfaces as an
+    /// [`OcppError`] from [`call`](Self::call)'s outbound validation, never a
+    /// panic or a silent truncation.
+    async fn emit_monitor_notify_event(
+        &self,
+        monitors: &[TrippedMonitor],
+        actual_value: &str,
+    ) -> OcppResult<MonitorTripOutcome> {
+        if monitors.is_empty() {
+            return Ok(MonitorTripOutcome::NoMonitor);
+        }
+
         let generated_at = v201_now();
-        let event_data: Vec<_> = matched
+        let event_data: Vec<_> = monitors
             .iter()
             .map(|m| {
                 v201_command::v201_monitor_event_data(
@@ -6868,15 +7035,6 @@ impl ChargePoint {
         // The `.conf` is empty (ack only); `call()` still schema-validates both
         // the outbound request and the ack. Discard it on success.
         let _ack = self.call(request).await?;
-
-        info!(
-            component = %component,
-            variable = %variable,
-            events,
-            seq_no,
-            // Presence/count only — `actual_value` is opaque and never logged.
-            "originated NotifyEvent for a variable-monitor trip; CSMS acknowledged"
-        );
 
         Ok(MonitorTripOutcome::Emitted { events, seq_no })
     }
@@ -13049,6 +13207,411 @@ mod tests {
                 .await,
             Err(OcppError::NotSupported { .. })
         ));
+    }
+
+    // --- SetVariables auto-trips a variable monitor (Issue #573) ---
+    //
+    // A CSMS `SetVariables` write that moves a monitored variable's Actual value
+    // across an installed threshold / delta monitor auto-originates a
+    // `NotifyEvent`, drained off the command-consumer task (never inline) so the
+    // `SetVariablesResponse` is flushed first. `OCPPCommCtrlr` / `HeartbeatInterval`
+    // seeds to "300" and is writable, so it is the fixture for these.
+
+    /// Build a V201 `SetVariables` CALL writing one component-variable's `Actual`
+    /// attribute (attributeType omitted → `Actual`).
+    fn make_v201_set_variables(component: &str, variable: &str, value: &str) -> CallMessage {
+        make_call(V201SetVariablesRequest {
+            set_variable_data: vec![ocpp_types::v201::SetVariableDataType {
+                attribute_value: value.to_string(),
+                component: ocpp_types::v201::ComponentType {
+                    name: component.to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: ocpp_types::v201::VariableType {
+                    name: variable.to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                attribute_type: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        })
+    }
+
+    /// Install one CSMS monitor of `kind` with threshold/delta `value` on
+    /// `OCPPCommCtrlr` / `variable`, returning its station-assigned id. The valued
+    /// twin of [`install_one_monitor`] for the auto-trip tests, which need a
+    /// specific threshold.
+    async fn install_valued_monitor(
+        cp: &ChargePoint,
+        variable: &str,
+        kind: ocpp_types::v201::MonitorEnumType,
+        value: f64,
+    ) -> i32 {
+        use ocpp_types::v201::SetMonitoringStatusEnumType;
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+                v201_monitor_data("OCPPCommCtrlr", variable, kind, value, 3),
+            ])))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.set_monitoring_result[0].status,
+                    SetMonitoringStatusEnumType::Accepted
+                );
+                body.set_monitoring_result[0].id.expect("accepted → id")
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    /// Project the drained commands into just the auto-trips as
+    /// `(sorted monitor ids, reported actualValue)`, dropping any other queued
+    /// side effect — the concise shape the assertions below compare against.
+    fn monitor_trips(commands: &[RemoteCommand]) -> Vec<(Vec<i32>, String)> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                RemoteCommand::V201MonitorTrip {
+                    monitors,
+                    actual_value,
+                } => Some((
+                    monitors.iter().map(|m| m.id).collect::<Vec<_>>(),
+                    actual_value.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_upper_threshold_fires_on_each_crossing_with_hysteresis() {
+        use ocpp_types::v201::MonitorEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Alerting band = value > 900. Seed is "300" (below the band).
+        let id = install_valued_monitor(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            900.0,
+        )
+        .await;
+
+        for value in ["1000", "1100", "800", "700"] {
+            cp.handle_message(Message::Call(make_v201_set_variables(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                value,
+            )))
+            .await
+            .unwrap();
+        }
+
+        // "300"→"1000" enters the band (trip); "1000"→"1100" stays inside
+        // (hysteresis, no trip); "1100"→"800" leaves the band (trip);
+        // "800"→"700" stays below (no trip). Two crossings → two trips.
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            monitor_trips(&commands),
+            vec![
+                (vec![id], "1000".to_string()),
+                (vec![id], "800".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_lower_threshold_is_symmetric() {
+        use ocpp_types::v201::MonitorEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Alerting band = value < 200. Seed "300" is above the band.
+        let id = install_valued_monitor(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::LowerThreshold,
+            200.0,
+        )
+        .await;
+
+        for value in ["100", "150", "300"] {
+            cp.handle_message(Message::Call(make_v201_set_variables(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                value,
+            )))
+            .await
+            .unwrap();
+        }
+
+        // "300"→"100" enters (trip); "100"→"150" stays below 200 (no trip);
+        // "150"→"300" leaves (trip).
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            monitor_trips(&commands),
+            vec![(vec![id], "100".to_string()), (vec![id], "300".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_delta_fires_on_jump_not_subdelta() {
+        use ocpp_types::v201::MonitorEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let id =
+            install_valued_monitor(&cp, "HeartbeatInterval", MonitorEnumType::Delta, 50.0).await;
+
+        for value in ["360", "370", "500"] {
+            cp.handle_message(Message::Call(make_v201_set_variables(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                value,
+            )))
+            .await
+            .unwrap();
+        }
+
+        // "300"→"360" jumps 60 ≥ 50 (trip); "360"→"370" jumps 10 < 50 (no trip);
+        // "370"→"500" jumps 130 (trip). A delta is measured per single write.
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            monitor_trips(&commands),
+            vec![(vec![id], "360".to_string()), (vec![id], "500".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_multiple_monitors_ride_one_id_sorted_trip() {
+        use ocpp_types::v201::MonitorEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Two monitors on the same variable: an upper threshold and a delta, both
+        // crossed by the same "300"→"1000" write.
+        let upper = install_valued_monitor(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            900.0,
+        )
+        .await;
+        let delta =
+            install_valued_monitor(&cp, "HeartbeatInterval", MonitorEnumType::Delta, 50.0).await;
+
+        cp.handle_message(Message::Call(make_v201_set_variables(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            "1000",
+        )))
+        .await
+        .unwrap();
+
+        // Both cross on the one write → a single trip carrying both monitors,
+        // id-sorted (matching `monitors_for_variable`), so the emitter builds one
+        // NotifyEvent with two correlated events.
+        let mut ids = vec![upper, delta];
+        ids.sort_unstable();
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(monitor_trips(&commands), vec![(ids, "1000".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_rejected_write_never_trips() {
+        use ocpp_types::v201::{MonitorEnumType, SetMonitoringStatusEnumType};
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // SecurityCtrlr/MaxCertificateChainSize is read-only (seed "3"); install a
+        // monitor on it that *would* cross, then attempt a write. The write is
+        // Rejected → no mutation → no trip.
+        let install = cp
+            .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+                v201_monitor_data(
+                    "SecurityCtrlr",
+                    "MaxCertificateChainSize",
+                    MonitorEnumType::UpperThreshold,
+                    2.0,
+                    3,
+                ),
+            ])))
+            .await
+            .unwrap();
+        match install.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.set_monitoring_result[0].status,
+                    SetMonitoringStatusEnumType::Accepted,
+                    "a monitor can be installed on a read-only variable",
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        let resp = cp
+            .handle_message(Message::Call(make_call(V201SetVariablesRequest {
+                set_variable_data: vec![ocpp_types::v201::SetVariableDataType {
+                    attribute_value: "10".to_string(),
+                    component: ocpp_types::v201::ComponentType {
+                        name: "SecurityCtrlr".to_string(),
+                        instance: None,
+                        evse: None,
+                        custom_data: None,
+                    },
+                    variable: ocpp_types::v201::VariableType {
+                        name: "MaxCertificateChainSize".to_string(),
+                        instance: None,
+                        custom_data: None,
+                    },
+                    attribute_type: None,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            })))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariablesResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.set_variable_result[0].attribute_status,
+                    SetVariableStatusEnumType::Rejected
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(
+            monitor_trips(&v201_drain_commands(&cp).await).is_empty(),
+            "a Rejected write must not trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_non_monitored_write_never_trips() {
+        // A write that changes a variable no monitor watches trips nothing.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_set_variables(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            "1000",
+        )))
+        .await
+        .unwrap();
+        assert!(monitor_trips(&v201_drain_commands(&cp).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_periodic_monitor_never_trips() {
+        use ocpp_types::v201::MonitorEnumType;
+        // Periodic monitors are time-driven, not write-driven — a crossing write
+        // never trips them.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_valued_monitor(&cp, "HeartbeatInterval", MonitorEnumType::Periodic, 60.0).await;
+        cp.handle_message(Message::Call(make_v201_set_variables(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            "1000",
+        )))
+        .await
+        .unwrap();
+        assert!(monitor_trips(&v201_drain_commands(&cp).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_no_op_rewrite_does_not_trip() {
+        use ocpp_types::v201::MonitorEnumType;
+        // Rewriting the seed value ("300") is Accepted but changes nothing, so it
+        // crosses nothing — no phantom trip.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_valued_monitor(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            900.0,
+        )
+        .await;
+        cp.handle_message(Message::Call(make_v201_set_variables(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            "300",
+        )))
+        .await
+        .unwrap();
+        assert!(monitor_trips(&v201_drain_commands(&cp).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_non_numeric_value_trips_nothing_without_panic() {
+        use ocpp_types::v201::MonitorEnumType;
+        // Trust boundary: a monitored variable can be written a non-numeric value.
+        // It is stored verbatim and cannot cross a numeric threshold, so it trips
+        // nothing — and never panics on the parse.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_valued_monitor(&cp, "HeartbeatInterval", MonitorEnumType::Delta, 50.0).await;
+        cp.handle_message(Message::Call(make_v201_set_variables(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            "not-a-number",
+        )))
+        .await
+        .unwrap();
+        assert!(monitor_trips(&v201_drain_commands(&cp).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_crossing_emits_notify_event_after_response() {
+        use ocpp_types::v201::MonitorEnumType;
+        // End-to-end over a real socket: the crossing NotifyEvent is emitted off
+        // the command-consumer task *after* the SetVariablesResponse, correlated
+        // to the installed monitor.
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        let id = install_valued_monitor(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            900.0,
+        )
+        .await;
+
+        // The write is answered synchronously (Accepted) …
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_variables(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                "1000",
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariablesResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.set_variable_result[0].attribute_status,
+                    SetVariableStatusEnumType::Accepted
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        // … and the NotifyEvent follows on the wire, correlated to the monitor.
+        let payload = recv_notify_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 0);
+        let events = payload["eventData"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e["trigger"], "Alerting");
+        assert_eq!(e["eventNotificationType"], "CustomMonitor");
+        assert_eq!(e["actualValue"], "1000");
+        assert_eq!(e["variableMonitoringId"], id);
+        assert_eq!(e["component"]["name"], "OCPPCommCtrlr");
+        assert_eq!(e["variable"]["name"], "HeartbeatInterval");
     }
 
     #[tokio::test]

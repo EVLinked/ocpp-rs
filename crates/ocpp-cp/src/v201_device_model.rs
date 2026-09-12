@@ -136,6 +136,57 @@ struct MonitorEntry {
     monitor: VariableMonitoringType,
 }
 
+impl MonitorEntry {
+    /// Project this entry into the [`TrippedMonitor`] an emitter needs — the
+    /// station-assigned id, the monitor kind, and the display-form
+    /// component / variable. Shared by the lookup paths so both project a
+    /// matched monitor identically.
+    fn to_tripped(&self) -> TrippedMonitor {
+        TrippedMonitor {
+            id: self.monitor.id,
+            kind: self.monitor.kind,
+            component: self.component.clone(),
+            variable: self.variable.clone(),
+        }
+    }
+}
+
+/// Parse an opaque, stored variable value as a finite `f64` for numeric monitor
+/// evaluation, or `None` when it is not a finite number.
+///
+/// Variable values are opaque strings on the wire (a monitored variable's value
+/// is not guaranteed numeric). Threshold and delta monitors are numeric, so a
+/// value that does not parse as a finite `f64` — non-numeric text, or an
+/// explicit `NaN` / `inf` — participates in no numeric crossing. Leading and
+/// trailing ASCII whitespace is tolerated to match lenient CSMS input.
+fn parse_finite_f64(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// Whether a single write moving a numeric value `prev → next` should trip a
+/// monitor of `kind` configured with magnitude `value`.
+///
+/// The match is exhaustive without a wildcard so a newly-added
+/// [`MonitorEnumType`] is a compile error to classify here rather than a silent
+/// mis-trip.
+fn monitor_write_trips(kind: MonitorEnumType, value: f64, prev: f64, next: f64) -> bool {
+    match kind {
+        // Alerting bands. A crossing is the two samples sitting on opposite
+        // sides of the threshold. Strict `>` (upper) / `<` (lower) treat a value
+        // exactly on the threshold as *outside* the alerting band in both
+        // directions, so a write onto the threshold from inside the band fires
+        // (leaving) while one from outside does not (no phantom entry).
+        MonitorEnumType::UpperThreshold => (prev > value) != (next > value),
+        MonitorEnumType::LowerThreshold => (prev < value) != (next < value),
+        // A delta monitor fires when this single write jumps by at least the
+        // configured magnitude. `value` is a magnitude; compare the absolute
+        // change against its absolute value defensively.
+        MonitorEnumType::Delta => (next - prev).abs() >= value.abs(),
+        // Time-driven kinds are never write-driven.
+        MonitorEnumType::Periodic | MonitorEnumType::PeriodicClockAligned => false,
+    }
+}
+
 /// One installed variable monitor that a
 /// [`trip`](V201DeviceModel::monitors_for_variable) matched — the minimal
 /// projection of a `MonitorEntry` a `NotifyEvent` emitter needs to build a
@@ -769,8 +820,79 @@ impl V201DeviceModel {
     /// An empty result means no monitor watches that identity — the caller emits
     /// nothing (a no-op trip), never a panic.
     pub fn monitors_for_variable(&self, component: &str, variable: &str) -> Vec<TrippedMonitor> {
-        // Build the lookup key through the same normalization as install /
-        // snapshot, from a name-only component / variable (no instance, no EVSE).
+        let key = Self::monitor_lookup_key(component, variable);
+        let mut matches: Vec<TrippedMonitor> = self
+            .monitors
+            .values()
+            .filter(|entry| entry.key == key)
+            .map(MonitorEntry::to_tripped)
+            .collect();
+        matches.sort_by_key(|m| m.id);
+        matches
+    }
+
+    /// The subset of installed monitors on the (`component`, `variable`) identity
+    /// that a `SetVariables` write moving the variable's `Actual` value from
+    /// `previous` to `new` should **autonomously trip** (Issue #573) — the
+    /// write-driven counterpart to the injection-seam lookup
+    /// [`monitors_for_variable`](Self::monitors_for_variable), sorted by id so the
+    /// emitted event order is deterministic.
+    ///
+    /// Only the write-driven monitor kinds are ever selected:
+    /// - [`UpperThreshold`](MonitorEnumType::UpperThreshold) — trips when the
+    ///   value **crosses** the threshold in either direction (enters the alerting
+    ///   band `value > threshold`, or leaves it).
+    /// - [`LowerThreshold`](MonitorEnumType::LowerThreshold) — symmetric
+    ///   (`value < threshold`).
+    /// - [`Delta`](MonitorEnumType::Delta) — trips when the single write jumps by
+    ///   at least the configured delta (`|new − previous| ≥ value`).
+    ///
+    /// [`Periodic`](MonitorEnumType::Periodic) /
+    /// [`PeriodicClockAligned`](MonitorEnumType::PeriodicClockAligned) monitors are
+    /// time-driven, never write-driven, so they are never returned here.
+    ///
+    /// **Hysteresis** falls out of crossing detection: a write that leaves the
+    /// value on the same side of a threshold (or moves it by less than the delta)
+    /// crosses nothing and returns no monitor, so repeated same-band writes raise
+    /// no duplicate event. **Numeric evaluation only:** thresholds and deltas are
+    /// numeric ([`value: f64`](VariableMonitoringType::value)), so a `previous` /
+    /// `new` that does not parse as a finite `f64` can neither cross a threshold
+    /// nor exceed a delta and trips nothing — the opaque string is still reported
+    /// verbatim by the emitter, but a non-numeric (or `NaN`/infinite) value never
+    /// fabricates a numeric crossing.
+    pub fn monitors_tripped_by_write(
+        &self,
+        component: &str,
+        variable: &str,
+        previous: &str,
+        new: &str,
+    ) -> Vec<TrippedMonitor> {
+        // A threshold can only be crossed between two finite numeric samples; an
+        // unparseable value trips nothing (the value is still reported verbatim).
+        let (Some(prev), Some(next)) = (parse_finite_f64(previous), parse_finite_f64(new)) else {
+            return Vec::new();
+        };
+        let key = Self::monitor_lookup_key(component, variable);
+        let mut matches: Vec<TrippedMonitor> = self
+            .monitors
+            .values()
+            .filter(|entry| entry.key == key)
+            .filter(|entry| {
+                monitor_write_trips(entry.monitor.kind, entry.monitor.value, prev, next)
+            })
+            .map(MonitorEntry::to_tripped)
+            .collect();
+        matches.sort_by_key(|m| m.id);
+        matches
+    }
+
+    /// The normalized [`VariableKey`] a name-only (`component`, `variable`)
+    /// identity resolves to — the same normalization the install / snapshot paths
+    /// use, so lookups are case-insensitive and match the station-wide,
+    /// un-instanced identities the simulator seeds. Shared by
+    /// [`monitors_for_variable`](Self::monitors_for_variable) and
+    /// [`monitors_tripped_by_write`](Self::monitors_tripped_by_write).
+    fn monitor_lookup_key(component: &str, variable: &str) -> VariableKey {
         let component_ty = ComponentType {
             name: component.to_string(),
             instance: None,
@@ -782,21 +904,7 @@ impl V201DeviceModel {
             instance: None,
             custom_data: None,
         };
-        let key = VariableKey::from_request(&component_ty, &variable_ty);
-
-        let mut matches: Vec<TrippedMonitor> = self
-            .monitors
-            .values()
-            .filter(|entry| entry.key == key)
-            .map(|entry| TrippedMonitor {
-                id: entry.monitor.id,
-                kind: entry.monitor.kind,
-                component: entry.component.clone(),
-                variable: entry.variable.clone(),
-            })
-            .collect();
-        matches.sort_by_key(|m| m.id);
-        matches
+        VariableKey::from_request(&component_ty, &variable_ty)
     }
 
     /// Whether a monitor of the given [`MonitorEnumType`] falls under a requested
@@ -2270,5 +2378,174 @@ mod tests {
         assert!(model
             .monitors_for_variable("OCPPCommCtrlr", "NoSuchVariable")
             .is_empty());
+    }
+
+    // --- monitors_tripped_by_write: autonomous write-driven trips (#573) ----
+
+    #[test]
+    fn monitors_tripped_by_write_selects_only_crossed_write_driven_monitors() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        // An upper threshold (900), a delta (50), and a periodic (60) on the same
+        // variable. Only the write-driven kinds a crossing hits are selected.
+        let results = model.install_monitors(&[
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::UpperThreshold,
+                900.0,
+                3,
+            ),
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Delta,
+                50.0,
+                3,
+            ),
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Periodic,
+                60.0,
+                3,
+            ),
+        ]);
+        let ids: Vec<i32> = results.iter().map(|r| r.id.unwrap()).collect();
+        let (upper, delta) = (ids[0], ids[1]);
+
+        // "300"→"1000": crosses the upper threshold *and* jumps ≥ 50 → both,
+        // id-sorted; the periodic monitor is never selected.
+        let tripped =
+            model.monitors_tripped_by_write("OCPPCommCtrlr", "HeartbeatInterval", "300", "1000");
+        assert_eq!(tripped.iter().map(|m| m.id).collect::<Vec<_>>(), {
+            let mut v = vec![upper, delta];
+            v.sort_unstable();
+            v
+        });
+
+        // "300"→"320": below the threshold and a sub-delta jump → nothing.
+        assert!(model
+            .monitors_tripped_by_write("OCPPCommCtrlr", "HeartbeatInterval", "300", "320")
+            .is_empty());
+
+        // Non-numeric new value can cross nothing (still reported verbatim by the
+        // emitter, but no numeric trip).
+        assert!(model
+            .monitors_tripped_by_write("OCPPCommCtrlr", "HeartbeatInterval", "300", "oops")
+            .is_empty());
+
+        // A variable no monitor watches trips nothing.
+        assert!(model
+            .monitors_tripped_by_write("OCPPCommCtrlr", "NoSuchVariable", "1", "100000")
+            .is_empty());
+    }
+
+    #[test]
+    fn monitor_write_trips_predicate_covers_bands_deltas_and_time_driven() {
+        // Upper threshold 10: a crossing in either direction fires; staying on one
+        // side does not; sitting exactly on the threshold is treated as outside
+        // the alerting band (so entering from the value itself does not fire, and
+        // leaving onto it does).
+        assert!(monitor_write_trips(
+            MonitorEnumType::UpperThreshold,
+            10.0,
+            5.0,
+            15.0
+        ));
+        assert!(monitor_write_trips(
+            MonitorEnumType::UpperThreshold,
+            10.0,
+            15.0,
+            5.0
+        ));
+        assert!(!monitor_write_trips(
+            MonitorEnumType::UpperThreshold,
+            10.0,
+            11.0,
+            12.0
+        ));
+        assert!(!monitor_write_trips(
+            MonitorEnumType::UpperThreshold,
+            10.0,
+            5.0,
+            10.0
+        ));
+        assert!(monitor_write_trips(
+            MonitorEnumType::UpperThreshold,
+            10.0,
+            15.0,
+            10.0
+        ));
+
+        // Lower threshold 10: symmetric (alerting band = value < 10).
+        assert!(monitor_write_trips(
+            MonitorEnumType::LowerThreshold,
+            10.0,
+            15.0,
+            5.0
+        ));
+        assert!(monitor_write_trips(
+            MonitorEnumType::LowerThreshold,
+            10.0,
+            5.0,
+            15.0
+        ));
+        assert!(!monitor_write_trips(
+            MonitorEnumType::LowerThreshold,
+            10.0,
+            5.0,
+            8.0
+        ));
+
+        // Delta 50: a jump ≥ 50 (either sign) fires; a smaller jump does not.
+        assert!(monitor_write_trips(
+            MonitorEnumType::Delta,
+            50.0,
+            300.0,
+            360.0
+        ));
+        assert!(monitor_write_trips(
+            MonitorEnumType::Delta,
+            50.0,
+            360.0,
+            300.0
+        ));
+        assert!(monitor_write_trips(
+            MonitorEnumType::Delta,
+            50.0,
+            300.0,
+            350.0
+        ));
+        assert!(!monitor_write_trips(
+            MonitorEnumType::Delta,
+            50.0,
+            300.0,
+            349.0
+        ));
+
+        // Time-driven kinds are never write-driven.
+        assert!(!monitor_write_trips(
+            MonitorEnumType::Periodic,
+            0.0,
+            1.0,
+            1_000.0
+        ));
+        assert!(!monitor_write_trips(
+            MonitorEnumType::PeriodicClockAligned,
+            0.0,
+            1.0,
+            1_000.0
+        ));
+    }
+
+    #[test]
+    fn parse_finite_f64_rejects_non_finite_and_non_numeric() {
+        assert_eq!(parse_finite_f64("300"), Some(300.0));
+        assert_eq!(parse_finite_f64("  42.5 "), Some(42.5));
+        assert_eq!(parse_finite_f64("-7"), Some(-7.0));
+        assert_eq!(parse_finite_f64(""), None);
+        assert_eq!(parse_finite_f64("not-a-number"), None);
+        assert_eq!(parse_finite_f64("NaN"), None);
+        assert_eq!(parse_finite_f64("inf"), None);
     }
 }
