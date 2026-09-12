@@ -178,11 +178,12 @@ use ocpp_types::v201::{
     GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
     InstallCertificateUseEnumType, LogEnumType, LogStatusEnumType, MessageInfoType,
     MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType, MonitorEnumType,
-    OCSPRequestDataType, OperationalStatusEnumType, PublishFirmwareStatusEnumType,
-    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UnpublishFirmwareStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType, VariableType,
+    MonitoringDataType, OCSPRequestDataType, OperationalStatusEnumType,
+    PublishFirmwareStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
+    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    SetNetworkProfileStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
+    UnlockStatusEnumType, UnpublishFirmwareStatusEnumType, UpdateFirmwareStatusEnumType,
+    UploadLogStatusEnumType, VariableType,
 };
 
 use ocpp_messages::v201::{
@@ -195,9 +196,10 @@ use ocpp_messages::v201::{
     GetLogRequest, GetLogResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
     InstallCertificateResponse, LogStatusNotificationRequest, NotifyChargingLimitRequest,
     NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest, NotifyEVChargingNeedsRequest,
-    NotifyEVChargingScheduleRequest, NotifyEventRequest, PublishFirmwareRequest,
-    PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
-    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    NotifyEVChargingScheduleRequest, NotifyEventRequest, NotifyMonitoringReportRequest,
+    NotifyReportRequest, PublishFirmwareRequest, PublishFirmwareResponse,
+    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
     SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
@@ -1873,6 +1875,116 @@ pub fn v201_notify_customer_information_pages(
             custom_data: None,
         })
         .collect()
+}
+
+/// Entries per page for the OCPP 2.0.1 device-model report streams
+/// ([`NotifyReport`](NotifyReportRequest) / [`NotifyMonitoringReport`](NotifyMonitoringReportRequest)).
+///
+/// `GetBaseReport(FullInventory)` on a real station enumerates the whole device
+/// model — dozens to hundreds of entries — which routinely exceeds one practical
+/// WebSocket frame, so the report is *paged*: each page carries at most this many
+/// entries, a monotonic `seqNo` from 0, and `tbc` ("to be continued") set on every
+/// page but the last (OCPP 2.0.1 Part 2, `NotifyReport` / `NotifyMonitoringReport`).
+///
+/// A fixed entry count — rather than a byte-accurate budget negotiated from the
+/// transport MTU — is sufficient for the simulator, and is chosen comfortably
+/// above the seeded standard profile (~10 entries) so the default station still
+/// reports in a single page; a real frame-size budget is a later slice.
+pub const V201_REPORT_ENTRIES_PER_PAGE: usize = 25;
+
+/// Split `entries` into device-model report pages of at most
+/// [`V201_REPORT_ENTRIES_PER_PAGE`], numbering them with a monotonic `seqNo` from
+/// 0 and flagging every page but the last `tbc: Some(true)`; `build` turns each
+/// `(page_entries, tbc, seq_no)` into a concrete request. The paged core shared by
+/// the two device-model report streams, whose payloads differ only in element type
+/// — the multi-entry twin of the single-item
+/// [`v201_notify_display_messages_pages`] split.
+///
+/// An empty input still yields **exactly one** final page (`seqNo` 0, `tbc`
+/// omitted) carrying no entries — `build` is handed `None`, matching the emitter's
+/// long-standing unconditional single send; the report arrays are `minItems: 1`
+/// when present, so an empty page omits the array rather than sending `[]`. `seqNo`
+/// is `i32` on the wire, so the `i32::try_from(..).unwrap_or(i32::MAX)` guard means
+/// even a pathologically long report can never panic on the cast.
+fn v201_report_pages<T, R>(
+    entries: Vec<T>,
+    mut build: impl FnMut(Option<Vec<T>>, Option<bool>, i32) -> R,
+) -> Vec<R> {
+    if entries.is_empty() {
+        return vec![build(None, None, 0)];
+    }
+    let per_page = V201_REPORT_ENTRIES_PER_PAGE.max(1);
+    let page_count = entries.len().div_ceil(per_page);
+    let last = page_count - 1;
+    let mut iter = entries.into_iter();
+    (0..page_count)
+        .map(|i| {
+            let page: Vec<T> = iter.by_ref().take(per_page).collect();
+            build(
+                Some(page),
+                (i < last).then_some(true),
+                i32::try_from(i).unwrap_or(i32::MAX),
+            )
+        })
+        .collect()
+}
+
+/// Page the device-model report an `Accepted` `GetBaseReport` / `GetReport`
+/// streams back into `NotifyReport.req` CALL(s)
+/// ([`ocpp.v201.call.NotifyReport`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)).
+///
+/// One [`NotifyReportRequest`] per page of at most [`V201_REPORT_ENTRIES_PER_PAGE`]
+/// [`ReportDataType`] entries, every page echoing the triggering `request_id` so
+/// the CSMS can correlate the stream and stamped with a single `generated_at` (the
+/// instant the snapshot was taken, passed in so the builder stays pure and
+/// clock-free). Pages carry a monotonic [`seq_no`](NotifyReportRequest::seq_no)
+/// from 0; every page but the last is flagged
+/// [`tbc`](NotifyReportRequest::tbc) ("to be continued"), the final page leaving it
+/// absent (= `false`) — the same paging contract as
+/// [`v201_notify_customer_information_pages`]. An empty report still builds exactly
+/// one final page with no `reportData` (see the shared `v201_report_pages` core).
+#[must_use]
+pub fn v201_notify_report_pages(
+    request_id: i32,
+    generated_at: &str,
+    report_data: Vec<ReportDataType>,
+) -> Vec<NotifyReportRequest> {
+    v201_report_pages(report_data, |page, tbc, seq_no| NotifyReportRequest {
+        request_id,
+        generated_at: generated_at.to_string(),
+        report_data: page,
+        tbc,
+        seq_no,
+        custom_data: None,
+    })
+}
+
+/// Page the variable-monitoring snapshot an `Accepted` `GetMonitoringReport`
+/// streams back into `NotifyMonitoringReport.req` CALL(s)
+/// ([`ocpp.v201.call.NotifyMonitoringReport`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)).
+///
+/// The monitoring twin of [`v201_notify_report_pages`]: one
+/// [`NotifyMonitoringReportRequest`] per page of at most
+/// [`V201_REPORT_ENTRIES_PER_PAGE`] [`MonitoringDataType`] entries, same
+/// `request_id` correlation, single shared `generated_at`, monotonic `seqNo` from
+/// 0, and `tbc` on every page but the last. An empty snapshot still builds exactly
+/// one final page with no `monitor` array (see the shared `v201_report_pages` core).
+#[must_use]
+pub fn v201_notify_monitoring_report_pages(
+    request_id: i32,
+    generated_at: &str,
+    monitor_data: Vec<MonitoringDataType>,
+) -> Vec<NotifyMonitoringReportRequest> {
+    v201_report_pages(monitor_data, |page, tbc, seq_no| {
+        NotifyMonitoringReportRequest {
+            monitor: page,
+            request_id,
+            tbc,
+            seq_no,
+            generated_at: generated_at.to_string(),
+            custom_data: None,
+        }
+    })
 }
 
 /// Build a schema-valid `ClearDisplayMessage.conf` ([`ClearDisplayMessageResponse`]).
@@ -5110,6 +5222,233 @@ mod tests {
                     .is_ok(),
                 "built ReportChargingProfiles page (evse={}) should be schema-valid, got: {payload}",
                 page.evse_id
+            );
+        }
+    }
+
+    // ---- NotifyReport / NotifyMonitoringReport tbc paging (#574) ----
+
+    use ocpp_types::v201::{VariableAttributeType, VariableMonitoringType};
+
+    /// One synthetic `ReportDataType`; `n` distinguishes entries so page-order and
+    /// -count assertions are unambiguous.
+    fn sample_report_entry(n: usize) -> ReportDataType {
+        ReportDataType {
+            component: ComponentType {
+                name: format!("Comp{n}"),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: format!("Var{n}"),
+                instance: None,
+                custom_data: None,
+            },
+            variable_attribute: vec![VariableAttributeType {
+                kind: None,
+                value: Some(n.to_string()),
+                mutability: None,
+                persistent: None,
+                constant: None,
+                custom_data: None,
+            }],
+            variable_characteristics: None,
+            custom_data: None,
+        }
+    }
+
+    /// One synthetic `MonitoringDataType`; `n` distinguishes entries.
+    fn sample_monitor_entry(n: usize) -> MonitoringDataType {
+        MonitoringDataType {
+            component: ComponentType {
+                name: format!("Comp{n}"),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: format!("Var{n}"),
+                instance: None,
+                custom_data: None,
+            },
+            variable_monitoring: vec![VariableMonitoringType {
+                id: i32::try_from(n).unwrap(),
+                transaction: false,
+                value: 1.0,
+                kind: MonitorEnumType::Delta,
+                severity: 3,
+                custom_data: None,
+            }],
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn notify_report_small_report_is_one_unpaged_page() {
+        let data: Vec<ReportDataType> = (0..3).map(sample_report_entry).collect();
+        let pages = v201_notify_report_pages(77, "2022-01-01T10:00:00Z", data);
+        assert_eq!(pages.len(), 1, "a report under one page stays one page");
+        let page = &pages[0];
+        assert_eq!(page.request_id, 77, "the page echoes the requestId");
+        assert_eq!(page.seq_no, 0, "the single page is seqNo 0");
+        assert_eq!(page.generated_at, "2022-01-01T10:00:00Z");
+        assert!(
+            !page.tbc.unwrap_or(false),
+            "a single page is not 'to be continued'"
+        );
+        assert_eq!(
+            page.report_data.as_ref().map(Vec::len),
+            Some(3),
+            "the page carries every entry"
+        );
+    }
+
+    #[test]
+    fn notify_report_large_report_pages_with_tbc_and_monotonic_seqno() {
+        // 2*page + 1 entries → three pages: two full, one remainder.
+        let total = V201_REPORT_ENTRIES_PER_PAGE * 2 + 1;
+        let data: Vec<ReportDataType> = (0..total).map(sample_report_entry).collect();
+        let pages = v201_notify_report_pages(9, "t", data);
+        assert_eq!(pages.len(), 3, "2*page+1 entries span three pages");
+        // seqNo runs 0..N monotonically; tbc on every page but the last.
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(
+                page.seq_no,
+                i32::try_from(i).unwrap(),
+                "seqNo is the page index"
+            );
+            assert_eq!(page.request_id, 9, "every page echoes the requestId");
+            assert_eq!(page.generated_at, "t", "every page shares one generatedAt");
+        }
+        assert_eq!(pages[0].tbc, Some(true), "first page continues");
+        assert_eq!(pages[1].tbc, Some(true), "middle page continues");
+        assert!(
+            pages[2].tbc.is_none(),
+            "the last page is not 'to be continued'"
+        );
+        // Page sizes: full, full, remainder of one.
+        assert_eq!(
+            pages[0].report_data.as_ref().map(Vec::len),
+            Some(V201_REPORT_ENTRIES_PER_PAGE)
+        );
+        assert_eq!(
+            pages[2].report_data.as_ref().map(Vec::len),
+            Some(1),
+            "the final page carries the remainder"
+        );
+        // Entries are preserved in order across the page boundary (no loss/reorder).
+        assert_eq!(
+            pages[0].report_data.as_ref().unwrap()[0].variable.name,
+            "Var0"
+        );
+        assert_eq!(
+            pages[1].report_data.as_ref().unwrap()[0].variable.name,
+            format!("Var{V201_REPORT_ENTRIES_PER_PAGE}"),
+            "page 2 resumes exactly where page 1 stopped"
+        );
+    }
+
+    #[test]
+    fn notify_report_empty_is_one_final_page_without_report_data() {
+        // Empty input still yields exactly one final page (no zero-page emission),
+        // and omits `reportData` entirely — the array is minItems:1 when present.
+        let pages = v201_notify_report_pages(5, "t", Vec::new());
+        assert_eq!(
+            pages.len(),
+            1,
+            "empty report → exactly one page, never zero"
+        );
+        assert_eq!(pages[0].seq_no, 0);
+        assert!(pages[0].tbc.is_none(), "the sole page is not continued");
+        assert!(
+            pages[0].report_data.is_none(),
+            "an empty page omits reportData (minItems:1 when present)"
+        );
+    }
+
+    /// Wire fidelity: every built `NotifyReport` CALL — single, each page of a
+    /// multi-page stream, and the empty final page — satisfies the bundled OCPP
+    /// 2.0.1 `NotifyReport` request JSON Schema.
+    #[test]
+    fn built_notify_report_pages_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let total = V201_REPORT_ENTRIES_PER_PAGE + 2;
+        let data: Vec<ReportDataType> = (0..total).map(sample_report_entry).collect();
+        let mut all = v201_notify_report_pages(42, "2022-01-01T10:00:00Z", data);
+        all.extend(v201_notify_report_pages(
+            43,
+            "2022-01-01T10:00:00Z",
+            Vec::new(),
+        ));
+        assert_eq!(all.len(), 3, "two data pages + one empty page");
+        for page in &all {
+            let payload = serde_json::to_value(page).unwrap();
+            assert!(
+                validator.validate_call("NotifyReport", &payload).is_ok(),
+                "built NotifyReport page (seqNo={}) should be schema-valid, got: {payload}",
+                page.seq_no
+            );
+        }
+    }
+
+    #[test]
+    fn notify_monitoring_report_large_snapshot_pages_with_tbc_and_seqno() {
+        let total = V201_REPORT_ENTRIES_PER_PAGE + 1;
+        let data: Vec<MonitoringDataType> = (0..total).map(sample_monitor_entry).collect();
+        let pages = v201_notify_monitoring_report_pages(4, "t", data);
+        assert_eq!(pages.len(), 2, "page+1 entries span two pages");
+        assert_eq!(pages[0].seq_no, 0);
+        assert_eq!(pages[1].seq_no, 1);
+        assert_eq!(pages[0].tbc, Some(true), "first page continues");
+        assert!(pages[1].tbc.is_none(), "the last page is not continued");
+        assert!(
+            pages.iter().all(|p| p.request_id == 4),
+            "every page echoes the requestId"
+        );
+        assert_eq!(
+            pages[1].monitor.as_ref().map(Vec::len),
+            Some(1),
+            "the final page carries the remainder"
+        );
+    }
+
+    #[test]
+    fn notify_monitoring_report_empty_is_one_final_page_without_monitor() {
+        let pages = v201_notify_monitoring_report_pages(5, "t", Vec::new());
+        assert_eq!(
+            pages.len(),
+            1,
+            "empty snapshot → exactly one page, never zero"
+        );
+        assert_eq!(pages[0].seq_no, 0);
+        assert!(pages[0].tbc.is_none());
+        assert!(
+            pages[0].monitor.is_none(),
+            "an empty page omits the monitor array (minItems:1 when present)"
+        );
+    }
+
+    #[test]
+    fn built_notify_monitoring_report_pages_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let total = V201_REPORT_ENTRIES_PER_PAGE + 2;
+        let data: Vec<MonitoringDataType> = (0..total).map(sample_monitor_entry).collect();
+        let mut all = v201_notify_monitoring_report_pages(42, "2022-01-01T10:00:00Z", data);
+        all.extend(v201_notify_monitoring_report_pages(
+            43,
+            "2022-01-01T10:00:00Z",
+            Vec::new(),
+        ));
+        assert_eq!(all.len(), 3, "two data pages + one empty page");
+        for page in &all {
+            let payload = serde_json::to_value(page).unwrap();
+            assert!(
+                validator
+                    .validate_call("NotifyMonitoringReport", &payload)
+                    .is_ok(),
+                "built NotifyMonitoringReport page (seqNo={}) should be schema-valid, got: {payload}",
+                page.seq_no
             );
         }
     }
